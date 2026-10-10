@@ -1,0 +1,852 @@
+
+;==============================================================================
+; EZ-Flash Junior FPGA (XC3S200A) - PicoBlaze KCPSM3, program BANK 1
+; Same program in the FW0 application image and every firmware from FW1 on. The FW0
+; golden image (first bitstream in the FW0 flash dump) differs in one word:
+; 1B8 = LOAD s0, 01, which enables the MultiBoot boot path described below.
+;
+; Commented disassembly. Re-assembles to the original 1024 words (pbasm.py).
+; THIS FILE: FW0 golden image (first bitstream in the FW0 flash dump).
+; Identical to the standard bank 1 except 1B8 = LOAD s0, 01, which enables
+; the MultiBoot path (boot_multiboot) into the application image at 040000.
+;------------------------------------------------------------------------------
+; HOW THIS BANK RUNS
+;   This is the second program bank of the same core as bank 0 (see bank 0,
+;   bank_call). It is only ever entered at 3F3 (CALL dispatch), right after
+;   bank 0 writes 1 to port C8; registers and scratchpad are shared. The code
+;   at 000 (an endless delay loop) and the interrupt handler never run in
+;   normal operation, because the core always resets into bank 0.
+;
+;   dispatch (1B5):
+;     scratch 3F = 01 -> flash_page_write (firmware update, bank-0 event 08)
+;     otherwise       -> boot path: boot counter (and MultiBoot in the golden
+;                        image only), then the licence check.
+;
+;  LICENCE CHECK (anti-clone)
+;   On every boot this bank reads the FPGA's factory-programmed Device DNA and
+;   checks it against licence data stored in the SPI flash block at 030000,
+;   which also holds decoy records. If the check passes it leaves scratch
+;   3E = F1, 3F = F2; bank 0 refuses to load ROMs otherwise. The details of the
+;   check are intentionally not annotated in this release.
+;
+; PORTS
+;   D3 out  DNA_PORT: b0 CLK, b1 SHIFT, b2 READ      D3 in  b0 = DNA bit
+;   D4 out  SPI flash: b0 SCK, b1 CS (1 = idle), others 1 (idle value AF)
+;   D4 in   b7 = MISO        D5 out  b7 = MOSI
+;   D1 out  ICAP data byte    D2 out  ICAP control (b0 = clock strobe)
+;   F1 out  flash update busy (GB status via $7FD2 = 01)
+;   BF out / C0-C3 in: 512-byte table window (same as bank 0)
+;   A0/A1   debug output (same as bank 0)
+;
+; SPI FLASH COMMANDS USED: 03 read, 02 page program, D8 64 KB erase, 05 read
+;   status, 06 write enable; unreachable: 9F JEDEC ID, AB wake, 50 + 01 status
+;   write (unprotect).
+;
+; SCRATCHPAD (bank 1 use; bank 0 clears 00-3D afterwards anyway)
+;   00-02 MultiBoot address (02 = MSB)   03-05 flash address (05 = MSB)
+;   06, 0A-1A, 1E-3E  licence check working storage
+;   12 boot-counter byte  13 its index   1D shadow of port D4
+;==============================================================================
+
+
+            ADDRESS 000
+
+; ------------------------------------------------------------------------------
+; Reset entry of this bank: never executed (the core resets into bank 0).
+; ------------------------------------------------------------------------------
+bank1_reset:
+            DISABLE INTERRUPT              ; 000  [unreachable]
+bank1_idle:
+            CALL     delay_xxl             ; 001  [unreachable] endless delay
+            JUMP     bank1_idle            ; 002  [unreachable]
+
+; ------------------------------------------------------------------------------
+; DEVICE DNA (Spartan-3A DNA_PORT on port D3)
+; dna_read: READ pulse, then SHIFT mode, clock in 57 bits (39h) through the
+; shift chain s3 (LSB) .. sA (MSB), store in scratch 0A-11.
+; ------------------------------------------------------------------------------
+dna_idle:
+            LOAD     s0, 00                ; 003
+            OUTPUT   s0, D3                ; 004  DNA_PORT idle
+            RETURN                         ; 005
+dna_read:
+            LOAD     s0, 04                ; 006  READ = 1
+            OUTPUT   s0, D3                ; 007
+            CALL     dna_clock             ; 008  clock: load the DNA into the shift register
+            LOAD     s0, 02                ; 009  SHIFT = 1
+            OUTPUT   s0, D3                ; 00A
+            LOAD     s3, 00                ; 00B
+            LOAD     s2, 39                ; 00C  57 bits
+dna_shift_loop:
+            INPUT    s1, D3                ; 00D  DNA bit
+            TEST     s1, 01                ; 00E  carry = bit
+            SLA      s3                    ; 00F  shift into s3 .. sA
+            SLA      s4                    ; 010
+            SLA      s5                    ; 011
+            SLA      s6                    ; 012
+            SLA      s7                    ; 013
+            SLA      s8                    ; 014
+            SLA      s9                    ; 015
+            SLA      sA                    ; 016
+            CALL     dna_clock             ; 017  clock next bit
+            SUB      s2, 01                ; 018
+            JUMP     Z, dna_store          ; 019
+            JUMP     dna_shift_loop        ; 01A
+dna_store:
+            STORE    s3, 0A                ; 01B  DNA bits 7:0
+            STORE    s4, 0B                ; 01C
+            STORE    s5, 0C                ; 01D
+            STORE    s6, 0D                ; 01E
+            STORE    s7, 0E                ; 01F
+            STORE    s8, 0F                ; 020
+            STORE    s9, 10                ; 021
+            STORE    sA, 11                ; 022  most significant DNA byte
+            JUMP     dna_idle              ; 023
+dna_clock:
+            XOR      s0, 01                ; 024
+            OUTPUT   s0, D3                ; 025
+            XOR      s0, 01                ; 026
+            OUTPUT   s0, D3                ; 027
+            RETURN                         ; 028
+
+; Unreachable: print the DNA on the debug output.
+dbg_dump_dna:
+            LOAD     s9, 11                ; 029  [unreachable]
+dbg_dump_dna_L01:
+            FETCH    s0, (s9)              ; 02A  [unreachable]
+            LOAD     sE, s0                ; 02B  [unreachable]
+            CALL     dbg_putc              ; 02C  [unreachable]
+            COMPARE  s9, 0A                ; 02D  [unreachable]
+            RETURN Z                       ; 02E  [unreachable]
+            SUB      s9, 01                ; 02F  [unreachable]
+            JUMP     dbg_dump_dna_L01      ; 030  [unreachable]
+
+; licence_fn_a / licence_fn_b / licence_read / check_licence: licence check
+; helpers (not annotated in this release).
+licence_fn_a:
+            LOAD     s7, FF                ; 031
+            LOAD     s6, FF                ; 032
+licence_fn_a_L02:
+            FETCH    s2, (s4)              ; 033
+            LOAD     s3, 00                ; 034
+            XOR      s6, s2                ; 035
+licence_fn_a_L05:
+            COMPARE  s3, 08                ; 036
+            JUMP     Z, licence_fn_a_L0E   ; 037
+            ADD      s3, 01                ; 038
+            SR0      s7                    ; 039
+            SRA      s6                    ; 03A
+            JUMP     NC, licence_fn_a_L05  ; 03B
+            XOR      s7, A0                ; 03C
+            XOR      s6, 01                ; 03D
+            JUMP     licence_fn_a_L05      ; 03E
+licence_fn_a_L0E:
+            ADD      s4, 01                ; 03F
+            SUB      s5, 01                ; 040
+            JUMP     NZ, licence_fn_a_L02  ; 041
+            RETURN                         ; 042
+licence_fn_b:
+            LOAD     sF, 00                ; 043
+licence_fn_b_L01:
+            LOAD     s1, 08                ; 044
+            FETCH    s2, (s0)              ; 045
+licence_fn_b_L03:
+            SL0      sF                    ; 046
+            LOAD     sE, sF                ; 047
+            XOR      sE, s2                ; 048
+            RL       sE                    ; 049
+            AND      sE, 01                ; 04A
+            OR       sF, sE                ; 04B
+            RL       sE                    ; 04C
+            RL       sE                    ; 04D
+            RL       sE                    ; 04E
+            XOR      sE, sF                ; 04F
+            AND      sE, 08                ; 050
+            AND      sF, F7                ; 051
+            OR       sF, sE                ; 052
+            SL0      s2                    ; 053
+            SUB      s1, 01                ; 054
+            JUMP     NZ, licence_fn_b_L03  ; 055
+            ADD      s0, 01                ; 056
+            SUB      s4, 01                ; 057
+            JUMP     NZ, licence_fn_b_L01  ; 058
+            STORE    sF, 15                ; 059
+            RETURN                         ; 05A
+set_ok1:
+            LOAD     s0, F1                ; 05B
+            STORE    s0, 19                ; 05C
+            RETURN                         ; 05D
+set_ok2:
+            LOAD     s0, F2                ; 05E
+            STORE    s0, 1A                ; 05F
+            RETURN                         ; 060
+
+; dbg_putc: send sE to the debug output (port A1) once A0 bit 2 is clear.
+dbg_putc:
+            INPUT    s0, A0                ; 061  debug TX busy?
+            TEST     s0, 04                ; 062
+            JUMP     NZ, dbg_putc          ; 063
+            OUTPUT   sE, A1                ; 064  send byte
+            RETURN                         ; 065
+
+; ------------------------------------------------------------------------------
+; DELAYS (instruction counts): delay_s 24, delay_m 1.1k, delay_l 27k,
+; delay_xl 543k, delay_xxl 27.1M.
+; ------------------------------------------------------------------------------
+delay_s:
+            LOAD     s0, 0B                ; 066
+delay_s_L01:
+            SUB      s0, 01                ; 067
+            JUMP     NZ, delay_s_L01       ; 068
+            RETURN                         ; 069
+delay_m:
+            LOAD     s1, 28                ; 06A
+delay_m_L01:
+            CALL     delay_s               ; 06B
+            SUB      s1, 01                ; 06C
+            JUMP     NZ, delay_m_L01       ; 06D
+            RETURN                         ; 06E
+delay_l:
+            LOAD     s2, 19                ; 06F
+delay_l_L01:
+            CALL     delay_m               ; 070
+            SUB      s2, 01                ; 071
+            JUMP     NZ, delay_l_L01       ; 072
+            RETURN                         ; 073
+delay_xl:
+            LOAD     s3, 14                ; 074
+delay_xl_L01:
+            CALL     delay_l               ; 075
+            SUB      s3, 01                ; 076
+            JUMP     NZ, delay_xl_L01      ; 077
+            RETURN                         ; 078
+delay_xxl:
+            LOAD     s4, 32                ; 079
+delay_xxl_L01:
+            CALL     delay_xl              ; 07A
+            SUB      s4, 01                ; 07B
+            JUMP     NZ, delay_xxl_L01     ; 07C
+            RETURN                         ; 07D
+
+; ------------------------------------------------------------------------------
+; SPI FLASH (bit-banged on D4/D5; scratch 1D shadows D4)
+; spi_idle: D4 = AF (CS high).  spi_cs_toggle: flip CS.
+; spi_xfer: shift s2 out (MSB first, on D5 b7) while shifting MISO (D4 b7) in.
+; spi_xfer_end: transfer one byte, then raise CS.
+; ------------------------------------------------------------------------------
+spi_xfer_end:
+            CALL     spi_xfer              ; 07E
+            XOR      s0, 02                ; 07F
+            OUTPUT   s0, D4                ; 080
+            STORE    s0, 1D                ; 081
+            RETURN                         ; 082
+
+; Unreachable: spi_cmd1 sends sA as a one-byte command; flash_unprotect sends
+; AB (release from deep power-down), 50 (enable status write), then
+; 01 00 00 (write status = 00, clears the block-protect bits).
+spi_cmd1:
+            CALL     spi_idle              ; 083  [unreachable]
+            XOR      s0, 02                ; 084  [unreachable]
+            OUTPUT   s0, D4                ; 085  [unreachable]
+            STORE    s0, 1D                ; 086  [unreachable]
+            LOAD     s2, sA                ; 087  [unreachable]
+            JUMP     spi_xfer_end          ; 088  [unreachable]
+flash_unprotect:
+            LOAD     sA, AB                ; 089  [unreachable] AB: release from deep power-down
+            CALL     spi_cmd1              ; 08A  [unreachable]
+            LOAD     sA, 50                ; 08B  [unreachable] 50: enable write status register
+            CALL     spi_cmd1              ; 08C  [unreachable]
+            CALL     spi_idle              ; 08D  [unreachable]
+            XOR      s0, 02                ; 08E  [unreachable]
+            OUTPUT   s0, D4                ; 08F  [unreachable]
+            STORE    s0, 1D                ; 090  [unreachable]
+            LOAD     s2, 01                ; 091  [unreachable] 01: write status
+            CALL     spi_xfer              ; 092  [unreachable]
+            LOAD     s2, 00                ; 093  [unreachable] = 00
+            CALL     spi_xfer              ; 094  [unreachable]
+            LOAD     s2, 00                ; 095  [unreachable]
+            CALL     spi_xfer_end          ; 096  [unreachable]
+            RETURN                         ; 097  [unreachable]
+licence_read:
+            LOAD     s7, 7E                ; 098
+            LOAD     s6, 00                ; 099
+            LOAD     s4, 1E                ; 09A
+            CALL     flash_read_start      ; 09B
+licence_read_L04:
+            CALL     spi_xfer              ; 09C
+            ADD      s6, s2                ; 09D
+            COMPARE  s4, 3F                ; 09E
+            JUMP     C, licence_read_L09   ; 09F
+            JUMP     licence_read_L0B      ; 0A0
+licence_read_L09:
+            STORE    s2, (s4)              ; 0A1
+            ADD      s4, 01                ; 0A2
+licence_read_L0B:
+            SUB      s7, 01                ; 0A3
+            JUMP     NZ, licence_read_L04  ; 0A4
+            CALL     spi_xfer              ; 0A5
+            XOR      s6, s2                ; 0A6
+            CALL     spi_xfer              ; 0A7
+            CALL     spi_cs_toggle         ; 0A8
+            RETURN                         ; 0A9
+spi_idle:
+            LOAD     s0, AF                ; 0AA  CS high, SCK high
+            OUTPUT   s0, D4                ; 0AB
+            STORE    s0, 1D                ; 0AC
+            RETURN                         ; 0AD
+spi_xfer:
+            LOAD     s1, 08                ; 0AE  8 bits
+            FETCH    s0, 1D                ; 0AF
+spi_xfer_L02:
+            OUTPUT   s2, D5                ; 0B0  MOSI = s2 b7
+            XOR      s0, 01                ; 0B1  SCK edge
+            OUTPUT   s0, D4                ; 0B2
+            LOAD     s0, s0                ; 0B3
+            INPUT    s3, D4                ; 0B4  MISO
+            TEST     s3, 80                ; 0B5  carry = MISO
+            SLA      s2                    ; 0B6  shift in
+            XOR      s0, 01                ; 0B7  SCK edge
+            OUTPUT   s0, D4                ; 0B8
+            SUB      s1, 01                ; 0B9
+            JUMP     NZ, spi_xfer_L02      ; 0BA
+            RETURN                         ; 0BB
+
+; flash_read_status: RDSR (05); status in s2; CS raised afterwards.
+flash_read_status:
+            CALL     spi_idle              ; 0BC
+            XOR      s0, 02                ; 0BD  CS low
+            OUTPUT   s0, D4                ; 0BE
+            STORE    s0, 1D                ; 0BF
+            LOAD     s2, 05                ; 0C0  RDSR
+            CALL     spi_xfer              ; 0C1
+            JUMP     spi_xfer_end          ; 0C2
+
+; flash_write_enable: WREN (06).
+flash_write_enable:
+            CALL     spi_idle              ; 0C3
+            XOR      s0, 02                ; 0C4
+            OUTPUT   s0, D4                ; 0C5
+            STORE    s0, 1D                ; 0C6
+            LOAD     s2, 06                ; 0C7  WREN
+            JUMP     spi_xfer_end          ; 0C8
+
+; Unreachable: flash_read_id: JEDEC ID (9F) into sC, sB, sA.
+flash_read_id:
+            CALL     spi_idle              ; 0C9  [unreachable]
+            XOR      s0, 02                ; 0CA  [unreachable]
+            OUTPUT   s0, D4                ; 0CB  [unreachable]
+            STORE    s0, 1D                ; 0CC  [unreachable]
+            LOAD     s2, 9F                ; 0CD  [unreachable] JEDEC ID
+            CALL     spi_xfer              ; 0CE  [unreachable]
+            CALL     spi_xfer              ; 0CF  [unreachable]
+            LOAD     sC, s2                ; 0D0  [unreachable]
+            CALL     spi_xfer              ; 0D1  [unreachable]
+            LOAD     sB, s2                ; 0D2  [unreachable]
+            CALL     spi_xfer              ; 0D3  [unreachable]
+            LOAD     sA, s2                ; 0D4  [unreachable]
+            XOR      s0, 02                ; 0D5  [unreachable]
+            OUTPUT   s0, D4                ; 0D6  [unreachable]
+            STORE    s0, 1D                ; 0D7  [unreachable]
+            RETURN                         ; 0D8  [unreachable]
+
+; flash_read_start: READ (03) from sC:sB:sA, leaving CS low for spi_xfer.
+flash_read_start:
+            CALL     spi_idle              ; 0D9
+            XOR      s0, 02                ; 0DA  CS low
+            OUTPUT   s0, D4                ; 0DB
+            STORE    s0, 1D                ; 0DC
+            LOAD     s2, 03                ; 0DD  READ
+            CALL     spi_xfer              ; 0DE
+            LOAD     s2, sC                ; 0DF  address
+            CALL     spi_xfer              ; 0E0
+            LOAD     s2, sB                ; 0E1
+            CALL     spi_xfer              ; 0E2
+            LOAD     s2, sA                ; 0E3
+            CALL     spi_xfer              ; 0E4
+            RETURN                         ; 0E5
+spi_cs_toggle:
+            FETCH    s0, 1D                ; 0E6
+            XOR      s0, 02                ; 0E7
+            OUTPUT   s0, D4                ; 0E8
+            STORE    s0, 1D                ; 0E9
+            RETURN                         ; 0EA
+
+; flash_erase_64k: WREN, block erase (D8) at sC:sB:sA, wait until not busy.
+flash_erase_64k:
+            CALL     flash_write_enable    ; 0EB  WREN
+            CALL     spi_idle              ; 0EC
+            XOR      s0, 02                ; 0ED
+            OUTPUT   s0, D4                ; 0EE
+            STORE    s0, 1D                ; 0EF
+            LOAD     s2, D8                ; 0F0  BLOCK ERASE 64 KB
+            CALL     spi_xfer              ; 0F1
+            LOAD     s2, sC                ; 0F2
+            CALL     spi_xfer              ; 0F3
+            LOAD     s2, sB                ; 0F4
+            CALL     spi_xfer              ; 0F5
+            LOAD     s2, sA                ; 0F6
+            CALL     spi_xfer              ; 0F7
+            XOR      s0, 02                ; 0F8  CS high
+            OUTPUT   s0, D4                ; 0F9
+            STORE    s0, 1D                ; 0FA
+flash_erase_64k_L10:
+            CALL     flash_read_status     ; 0FB  busy?
+            TEST     s2, 01                ; 0FC
+            JUMP     NZ, flash_erase_64k_L10 ; 0FD
+            RETURN                         ; 0FE
+
+; flash_program_start: WREN, PAGE PROGRAM (02) at sC:sB:sA; CS stays low.
+; flash_program_end: raise CS and wait until the write is done.
+flash_program_start:
+            CALL     flash_write_enable    ; 0FF  WREN
+            CALL     spi_idle              ; 100
+            XOR      s0, 02                ; 101
+            OUTPUT   s0, D4                ; 102
+            STORE    s0, 1D                ; 103
+            LOAD     s2, 02                ; 104  PAGE PROGRAM
+            CALL     spi_xfer              ; 105
+            LOAD     s2, sC                ; 106
+            CALL     spi_xfer              ; 107
+            LOAD     s2, sB                ; 108
+            CALL     spi_xfer              ; 109
+            LOAD     s2, sA                ; 10A
+            CALL     spi_xfer              ; 10B
+            RETURN                         ; 10C
+flash_program_end:
+            FETCH    s0, 1D                ; 10D
+            XOR      s0, 02                ; 10E  CS high
+            OUTPUT   s0, D4                ; 10F
+            STORE    s0, 1D                ; 110
+flash_program_end_L04:
+            CALL     flash_read_status     ; 111  busy?
+            TEST     s2, 01                ; 112
+            JUMP     NZ, flash_program_end_L04 ; 113
+            RETURN                         ; 114
+
+; ------------------------------------------------------------------------------
+; icap_multiboot: send the Spartan-3A MultiBoot sequence to the ICAP (D1 data,
+; D2 control), rebooting the FPGA from SPI flash address [02]:[01]:[00]:
+;   AA99        sync
+;   3261 xxxx   GENERAL1 = start address bits 15:0
+;   3281 03xx   GENERAL2 = SPI read opcode 03, address bits 23:16
+;   32A1 004F   MODE_REG
+;   30A1 000E   CMD = REBOOT
+;   2000        NOOP
+; ------------------------------------------------------------------------------
+icap_multiboot:
+            CALL     icap_start            ; 115
+            LOAD     s3, AA                ; 116  sync AA99
+            CALL     icap_write            ; 117
+            LOAD     s3, 99                ; 118
+            CALL     icap_write            ; 119
+            LOAD     s3, 32                ; 11A  GENERAL1 (type-1 write, reg 13)
+            CALL     icap_write            ; 11B
+            LOAD     s3, 61                ; 11C
+            CALL     icap_write            ; 11D
+            FETCH    s3, 01                ; 11E  address bits 15:8
+            CALL     icap_write            ; 11F
+            FETCH    s3, 00                ; 120  address bits 7:0
+            CALL     icap_write            ; 121
+            LOAD     s3, 32                ; 122  GENERAL2 (reg 14)
+            CALL     icap_write            ; 123
+            LOAD     s3, 81                ; 124
+            CALL     icap_write            ; 125
+            LOAD     s3, 03                ; 126  SPI opcode 03 (read)
+            CALL     icap_write            ; 127
+            FETCH    s3, 02                ; 128  address bits 23:16
+            CALL     icap_write            ; 129
+            LOAD     s3, 32                ; 12A  MODE_REG (reg 15)
+            CALL     icap_write            ; 12B
+            LOAD     s3, A1                ; 12C
+            CALL     icap_write            ; 12D
+            LOAD     s3, 00                ; 12E
+            CALL     icap_write            ; 12F
+            LOAD     s3, 4F                ; 130
+            CALL     icap_write            ; 131
+            LOAD     s3, 30                ; 132  CMD (reg 05)
+            CALL     icap_write            ; 133
+            LOAD     s3, A1                ; 134
+            CALL     icap_write            ; 135
+            LOAD     s3, 00                ; 136
+            CALL     icap_write            ; 137
+            LOAD     s3, 0E                ; 138  000E = REBOOT
+            CALL     icap_write            ; 139
+            LOAD     s3, 20                ; 13A  NOOP
+            CALL     icap_write            ; 13B
+            LOAD     s3, 00                ; 13C
+            CALL     icap_write            ; 13D
+            CALL     icap_finish           ; 13E
+            RETURN                         ; 13F
+icap_finish:
+            LOAD     s0, 06                ; 140
+            OUTPUT   s0, D2                ; 141
+            CALL     icap_strobe           ; 142
+            CALL     icap_strobe           ; 143
+            RETURN                         ; 144
+icap_start:
+            LOAD     s0, 00                ; 145
+            OUTPUT   s0, D2                ; 146
+            RETURN                         ; 147
+icap_strobe:
+            XOR      s0, 01                ; 148
+            OUTPUT   s0, D2                ; 149
+            XOR      s0, 01                ; 14A
+            OUTPUT   s0, D2                ; 14B
+            RETURN                         ; 14C
+icap_write:
+            OUTPUT   s3, D1                ; 14D  data byte
+            CALL     icap_strobe           ; 14E
+            RETURN                         ; 14F
+
+; ------------------------------------------------------------------------------
+; BOOT COUNTER at flash 070000, used on every boot in every version: the boot
+; path clears one byte per boot (boot_count_consume). bootcnt_find: find the
+; first non-zero byte in 070000-0700FF; scratch 12 = its value, 13 = its index.
+; If all 256 are zero: erase the 64 KB block and use index 0 with value FF.
+; The FW0 dump shows 20 consumed bytes. In the golden image the counter
+; also drives MultiBoot: FF = try the application at 040000 (and mark the byte
+; 01); 01 = the application did not take over last time (FPGA fell back to the
+; golden image), so consume the byte and carry on as the golden image.
+; ------------------------------------------------------------------------------
+bootcnt_find:
+            LOAD     sC, 07                ; 150  070000
+            LOAD     sB, 00                ; 151
+            LOAD     sA, 00                ; 152
+            LOAD     s6, 00                ; 153
+bootcnt_find_L04:
+            CALL     flash_read_start      ; 154  READ
+            CALL     spi_xfer              ; 155
+            CALL     spi_cs_toggle         ; 156
+            COMPARE  s2, 00                ; 157  non-zero = unused/partly used
+            JUMP     NZ, bootcnt_found     ; 158
+            ADD      sA, 01                ; 159
+            ADDCY    sB, 00                ; 15A
+            ADDCY    sC, 00                ; 15B
+            ADD      s6, 01                ; 15C
+            COMPARE  s6, 00                ; 15D
+            JUMP     NZ, bootcnt_find_L04  ; 15E
+            CALL     bootcnt_erase         ; 15F  all 256 used: erase the block
+            LOAD     s0, FF                ; 160  value FF
+            STORE    s0, 12                ; 161
+            LOAD     s0, 00                ; 162
+            STORE    s0, 13                ; 163
+            RETURN                         ; 164
+bootcnt_found:
+            STORE    s2, 12                ; 165  value
+            STORE    s6, 13                ; 166  index
+            RETURN                         ; 167
+bootcnt_erase:
+            LOAD     sC, 07                ; 168
+            LOAD     sB, 00                ; 169
+            LOAD     sA, 00                ; 16A
+            CALL     flash_erase_64k       ; 16B
+            RETURN                         ; 16C
+
+; Unreachable: scratch 14 = 1 if the counter byte was FF.
+bootcnt_flag:
+            FETCH    s0, 12                ; 16D  [unreachable]
+            COMPARE  s0, FF                ; 16E  [unreachable]
+            JUMP     Z, bootcnt_flag_L06   ; 16F  [unreachable]
+            LOAD     s0, 00                ; 170  [unreachable]
+            STORE    s0, 14                ; 171  [unreachable]
+            RETURN                         ; 172  [unreachable]
+bootcnt_flag_L06:
+            LOAD     s0, 01                ; 173  [unreachable]
+            STORE    s0, 14                ; 174  [unreachable]
+            RETURN                         ; 175  [unreachable]
+
+; Interrupt handler for this bank (unused): debug DD.
+bank1_isr:
+            LOAD     sE, DD                ; 176  [unreachable]
+            CALL     dbg_putc              ; 177  [unreachable]
+            RETURNI  ENABLE                ; 178  [unreachable]
+licence_mark_bad:
+            LOAD     s0, EE                ; 179
+            STORE    s0, 06                ; 17A
+            RETURN                         ; 17B
+check_licence:
+            FETCH    s7, 0A                ; 17C
+            STORE    s7, 39                ; 17D
+            FETCH    s7, 0B                ; 17E
+            STORE    s7, 38                ; 17F
+            FETCH    s7, 0C                ; 180
+            STORE    s7, 37                ; 181
+            FETCH    s7, 0D                ; 182
+            STORE    s7, 36                ; 183
+            FETCH    s7, 0E                ; 184
+            STORE    s7, 35                ; 185
+            FETCH    s7, 0F                ; 186
+            STORE    s7, 34                ; 187
+            FETCH    s7, 10                ; 188
+            STORE    s7, 33                ; 189
+            FETCH    s7, 11                ; 18A
+            STORE    s7, 32                ; 18B
+            LOAD     s4, 1E                ; 18C
+            LOAD     s5, 1C                ; 18D
+            CALL     licence_fn_a          ; 18E
+            FETCH    s5, 17                ; 18F
+            FETCH    s4, 18                ; 190
+            COMPARE  s7, s5                ; 191
+            JUMP     NZ, check_licence_L19 ; 192
+            COMPARE  s6, s4                ; 193
+            CALL     Z, set_ok1            ; 194
+check_licence_L19:
+            FETCH    s7, 0A                ; 195
+            STORE    s7, 2F                ; 196
+            FETCH    s7, 0B                ; 197
+            STORE    s7, 2E                ; 198
+            FETCH    s7, 0C                ; 199
+            STORE    s7, 2D                ; 19A
+            FETCH    s7, 0D                ; 19B
+            STORE    s7, 2C                ; 19C
+            FETCH    s7, 0E                ; 19D
+            STORE    s7, 2B                ; 19E
+            FETCH    s7, 0F                ; 19F
+            STORE    s7, 2A                ; 1A0
+            FETCH    s7, 10                ; 1A1
+            STORE    s7, 29                ; 1A2
+            FETCH    s7, 11                ; 1A3
+            STORE    s7, 28                ; 1A4
+            LOAD     s0, 1E                ; 1A5
+            LOAD     s4, 12                ; 1A6
+            CALL     licence_fn_b          ; 1A7
+            FETCH    s0, 16                ; 1A8
+            COMPARE  s0, sF                ; 1A9
+            CALL     Z, set_ok2            ; 1AA
+            RETURN                         ; 1AB
+
+; clear_scratch: zero scratchpad 00-3D (keeps 3E/3F).
+clear_scratch:
+            LOAD     s6, 00                ; 1AC
+            LOAD     s4, 00                ; 1AD
+clear_scratch_L02:
+            COMPARE  s4, 3E                ; 1AE
+            JUMP     C, clear_scratch_L05  ; 1AF
+            JUMP     clear_scratch_L08     ; 1B0
+clear_scratch_L05:
+            STORE    s6, (s4)              ; 1B1
+            ADD      s4, 01                ; 1B2
+            JUMP     clear_scratch_L02     ; 1B3
+clear_scratch_L08:
+            RETURN                         ; 1B4
+
+; ------------------------------------------------------------------------------
+; dispatch: called from bank_call (3F3) whenever bank 0 switches to this bank.
+; ------------------------------------------------------------------------------
+dispatch:
+            FETCH    s2, 3F                ; 1B5  update request?
+            COMPARE  s2, 01                ; 1B6
+            JUMP     Z, flash_page_write   ; 1B7  -> program a flash page
+            LOAD     s0, 01                ; 1B8  build constant: 01 = MultiBoot enabled (golden image)
+            COMPARE  s0, 01                ; 1B9
+            JUMP     Z, boot_multiboot     ; 1BA
+            CALL     bootcnt_find          ; 1BB  locate the boot counter (no MultiBoot)
+            JUMP     boot_count_consume    ; 1BC
+
+; MultiBoot path (golden image only): long delay, then if the counter byte is
+; fresh (FF), check that a bitstream exists at 040000 and reboot into it.
+; boot_count_consume (all versions): program 00 into the current counter byte,
+; then run the licence check.
+boot_multiboot:
+            CALL     delay_xxl             ; 1BD
+            CALL     bootcnt_find          ; 1BE
+            FETCH    s0, 12                ; 1BF  counter byte
+            COMPARE  s0, FF                ; 1C0  FF = fresh: try the application image
+            JUMP     Z, boot_scan_image    ; 1C1
+boot_count_consume:
+            LOAD     sC, 07                ; 1C2  070000 + index
+            LOAD     sB, 00                ; 1C3
+            FETCH    sA, 13                ; 1C4
+            CALL     flash_program_start   ; 1C5
+            LOAD     s2, 00                ; 1C6  program 00: byte consumed
+            CALL     spi_xfer              ; 1C7
+            CALL     flash_program_end     ; 1C8
+            JUMP     licence_check         ; 1C9
+
+; boot_scan_image: read flash from 040000; skip up to E0 bytes of FF, expect the
+; sync word AA 99, then look for 31 61 (the COR2 write that follows the RCRC
+; command) before byte F8 of the read. Found: mark the counter byte 01 and
+; MultiBoot to 040000. Otherwise debug 44 and continue as the golden image.
+boot_scan_image:
+            LOAD     sC, 04                ; 1CA  040000
+            LOAD     sB, 00                ; 1CB
+            LOAD     sA, 00                ; 1CC
+            LOAD     s6, 00                ; 1CD
+            CALL     flash_read_start      ; 1CE
+boot_scan_image_L05:
+            CALL     spi_xfer              ; 1CF  skip FF bytes
+            COMPARE  s2, FF                ; 1D0
+            JUMP     NZ, boot_scan_image_L0C ; 1D1
+            ADD      s6, 01                ; 1D2
+            COMPARE  s6, E0                ; 1D3  up to E0
+            JUMP     Z, boot_scan_fail     ; 1D4
+            JUMP     boot_scan_image_L05   ; 1D5
+boot_scan_image_L0C:
+            COMPARE  s2, AA                ; 1D6  sync AA
+            JUMP     NZ, boot_scan_fail    ; 1D7
+            CALL     spi_xfer              ; 1D8
+            COMPARE  s2, 99                ; 1D9  sync 99
+            JUMP     NZ, boot_scan_fail    ; 1DA
+boot_scan_image_L11:
+            ADD      s6, 01                ; 1DB
+            COMPARE  s6, F8                ; 1DC
+            JUMP     Z, boot_scan_fail     ; 1DD
+            CALL     spi_xfer              ; 1DE
+            COMPARE  s2, 31                ; 1DF  31
+            JUMP     NZ, boot_scan_image_L11 ; 1E0
+            CALL     spi_xfer              ; 1E1
+            COMPARE  s2, 61                ; 1E2  61
+            JUMP     NZ, boot_scan_image_L11 ; 1E3
+            CALL     spi_cs_toggle         ; 1E4
+            LOAD     sC, 07                ; 1E5
+            LOAD     sB, 00                ; 1E6
+            FETCH    sA, 13                ; 1E7
+            CALL     flash_program_start   ; 1E8
+            LOAD     s2, 01                ; 1E9  program 01: attempt marked
+            CALL     spi_xfer              ; 1EA
+            CALL     flash_program_end     ; 1EB
+            LOAD     s1, 04                ; 1EC  MultiBoot address 040000
+            STORE    s1, 02                ; 1ED
+            LOAD     s1, 00                ; 1EE
+            STORE    s1, 01                ; 1EF
+            LOAD     s1, 00                ; 1F0
+            STORE    s1, 00                ; 1F1
+            CALL     icap_finish           ; 1F2
+            CALL     icap_multiboot        ; 1F3  reboot (does not return)
+boot_scan_fail:
+            CALL     spi_cs_toggle         ; 1F4
+            LOAD     sE, 44                ; 1F5  debug 44
+            CALL     dbg_putc              ; 1F6
+            JUMP     boot_count_consume    ; 1F7
+
+; licence_check: Device DNA licence check (not annotated in this release).
+; Result is left in scratch 3E/3F for bank 0.
+licence_check:
+            CALL     dna_idle              ; 1F8
+            CALL     dna_read              ; 1F9
+            CALL     spi_idle              ; 1FA
+            LOAD     s0, 03                ; 1FB
+            STORE    s0, 05                ; 1FC
+            LOAD     s0, 00                ; 1FD
+            STORE    s0, 04                ; 1FE
+            LOAD     s0, 00                ; 1FF
+            STORE    s0, 03                ; 200
+licence_loop:
+            FETCH    sC, 05                ; 201
+            FETCH    sB, 04                ; 202
+            FETCH    sA, 03                ; 203
+            COMPARE  sB, 15                ; 204
+            JUMP     Z, licence_result     ; 205
+            CALL     licence_read          ; 206
+            COMPARE  s2, s6                ; 207
+            CALL     NZ, licence_mark_bad  ; 208
+            COMPARE  sB, 11                ; 209
+            JUMP     NZ, licence_next      ; 20A
+            COMPARE  sA, 00                ; 20B
+            JUMP     NZ, licence_next      ; 20C
+            FETCH    s0, 28                ; 20D
+            STORE    s0, 16                ; 20E
+            FETCH    s0, 32                ; 20F
+            STORE    s0, 17                ; 210
+            FETCH    s0, 33                ; 211
+            STORE    s0, 18                ; 212
+            CALL     check_licence         ; 213
+licence_next:
+            FETCH    sC, 05                ; 214
+            FETCH    sB, 04                ; 215
+            FETCH    sA, 03                ; 216
+            ADD      sA, 80                ; 217
+            ADDCY    sB, 00                ; 218
+            ADDCY    sC, 00                ; 219
+            STORE    sC, 05                ; 21A
+            STORE    sB, 04                ; 21B
+            STORE    sA, 03                ; 21C
+            JUMP     licence_loop          ; 21D
+licence_result:
+            FETCH    s0, 06                ; 21E
+            COMPARE  s0, EE                ; 21F
+            JUMP     Z, licence_result_L08 ; 220
+            FETCH    s0, 19                ; 221
+            STORE    s0, 3E                ; 222
+            FETCH    s0, 1A                ; 223
+            STORE    s0, 3F                ; 224
+            CALL     clear_scratch         ; 225
+licence_result_L08:
+            RETURN                         ; 226
+
+; table_read: 32-bit word s5 of the 512-byte table window (BF / C0-C3).
+table_read:
+            OUTPUT   s5, BF                ; 227
+            LOAD     s1, s1                ; 228
+            LOAD     s1, s1                ; 229
+            INPUT    s3, C0                ; 22A
+            INPUT    s2, C1                ; 22B
+            INPUT    s1, C2                ; 22C
+            INPUT    s0, C3                ; 22D
+            RETURN                         ; 22E
+
+; ------------------------------------------------------------------------------
+; flash_page_write (firmware update, bank-0 event 08 with scratch 3F = 01):
+;   table word 00     = flash address (bits 23:0)
+;   table words 01-40 = 256 data bytes
+; If address bits 15:8 are 0, first erase the 64 KB block. Then page-program the
+; 256 bytes. F1 = 1 while busy (the Game Boy polls it via $7FD2 = 01).
+; ------------------------------------------------------------------------------
+flash_page_write:
+            LOAD     s2, 01                ; 22F  busy
+            OUTPUT   s2, F1                ; 230
+            LOAD     s5, 00                ; 231
+            CALL     table_read            ; 232  word 00: flash address
+            STORE    s2, 05                ; 233
+            STORE    s1, 04                ; 234
+            STORE    s0, 03                ; 235
+            COMPARE  s1, 00                ; 236  address bits 15:8 = 0?
+            JUMP     NZ, flash_page_write_L0D ; 237
+            LOAD     sC, s2                ; 238
+            LOAD     sB, s1                ; 239
+            LOAD     sA, s0                ; 23A
+            CALL     flash_erase_64k       ; 23B  yes: erase the 64 KB block first
+flash_page_write_L0D:
+            FETCH    sC, 05                ; 23C
+            FETCH    sB, 04                ; 23D
+            FETCH    sA, 03                ; 23E
+            CALL     flash_program_start   ; 23F  PAGE PROGRAM at the address
+            LOAD     s5, 01                ; 240  words 01..40
+flash_page_write_L12:
+            CALL     table_read            ; 241
+            STORE    s3, 0D                ; 242
+            STORE    s2, 0C                ; 243
+            STORE    s1, 0B                ; 244
+            LOAD     s2, s0                ; 245  send the four bytes of the word
+            CALL     spi_xfer              ; 246
+            FETCH    s2, 0B                ; 247
+            CALL     spi_xfer              ; 248
+            FETCH    s2, 0C                ; 249
+            CALL     spi_xfer              ; 24A
+            FETCH    s2, 0D                ; 24B
+            CALL     spi_xfer              ; 24C
+            ADD      s5, 01                ; 24D
+            COMPARE  s5, 41                ; 24E  256 bytes
+            JUMP     NZ, flash_page_write_L12 ; 24F
+            CALL     flash_program_end     ; 250  finish and wait
+            LOAD     s2, 00                ; 251
+            OUTPUT   s2, F1                ; 252  not busy
+            RETURN                         ; 253
+
+            ADDRESS 3F0
+            LOAD     s0, 01                ; 3F0  [unreachable]
+            OUTPUT   s0, C8                ; 3F1  [unreachable] (bank 1 already selected)
+            LOAD     s0, s0                ; 3F2  [unreachable]
+            CALL     dispatch              ; 3F3  entry point from bank 0
+            LOAD     s0, 00                ; 3F4
+            OUTPUT   s0, C8                ; 3F5  back to bank 0
+            LOAD     s0, s0                ; 3F6
+            RETURN                         ; 3F7
+            LOAD     s0, 00                ; 3F8  [unreachable]
+            LOAD     s0, 00                ; 3F9  [unreachable]
+            LOAD     s0, 00                ; 3FA  [unreachable]
+            LOAD     s0, 00                ; 3FB  [unreachable]
+            LOAD     s0, 00                ; 3FC  [unreachable]
+            LOAD     s0, 00                ; 3FD  [unreachable]
+            LOAD     s0, 00                ; 3FE  [unreachable]
+            JUMP     bank1_isr             ; 3FF  [unreachable]

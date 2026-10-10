@@ -1,0 +1,41 @@
+; Instruction-level diff FW1-FW3 -> FW4. Pure relocations (same instruction,
+; target moved with the code) and zero padding are left out.
+; Addresses: old / new.  7 change blocks
+
+@@ replace  old 1D4-1D6  new 1D4-1D4
+  - 1D4 30177  CALL 177
+  - 1D5 3016D  CALL 16D
+  - 1D6 3016D  CALL 16D
+  + 1D4 30172  CALL 172
+
+@@ delete  old 29E-2A7  new 29C-29B
+  - 29E 01400  LOAD s4, s0
+  - 29F 01F30  LOAD sF, s3
+  - 2A0 30155  CALL 155
+  - 2A1 01F20  LOAD sF, s2
+  - 2A2 30155  CALL 155
+  - 2A3 01F10  LOAD sF, s1
+  - 2A4 30155  CALL 155
+  - 2A5 01F40  LOAD sF, s4
+  - 2A6 30155  CALL 155
+  - 2A7 01040  LOAD s0, s4
+
+@@ delete  old 2DC-2DD  new 2D0-2CF
+  - 2DC 01F10  LOAD sF, s1
+  - 2DD 30155  CALL 155
+
+@@ delete  old 3A3-3A4  new 395-394
+  - 3A3 00FDD  LOAD sF, DD
+  - 3A4 30155  CALL 155
+
+@@ delete  old 3A6-3A7  new 396-395
+  - 3A6 01F30  LOAD sF, s3
+  - 3A7 30155  CALL 155
+
+@@ delete  old 3AE-3AF  new 39C-39B
+  - 3AE 00F44  LOAD sF, 44
+  - 3AF 30155  CALL 155
+
+@@ replace  old 3FF-3FF  new 3FF-3FF
+  - 3FF 343A3  JUMP 3A3
+  + 3FF 34395  JUMP 395

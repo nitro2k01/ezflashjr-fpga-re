@@ -1,0 +1,1312 @@
+;==============================================================================
+; EZ-Flash Junior FPGA (XC3S200A) - PicoBlaze KCPSM3, program BANK 0
+; Firmware FW5 (slot A of the FW5 update ROM, the image that is installed).
+; Extra ports: A5-A9 in = MBC3 RTC base values S, M, H, DL, DH;
+; A5-A9 out = emulated MBC3 RTC registers; BB in = loader option.
+; Scratch 33-36 = elapsed s/min/h/days, 37 = last PCF8563 seconds,
+; 2B = sampled BB. The E4-E7 dead code of earlier versions is gone.
+;
+; Commented disassembly. Re-assembles to the original 1024 words (pbasm.py).
+; Labels, comments and section headers are shared with the FW4 listing and
+; were carried over by instruction alignment; code that only exists in this
+; version is annotated separately.
+;------------------------------------------------------------------------------
+; ARCHITECTURE
+;   One KCPSM3 core runs from two 1K-word program BRAMs (bank 0 = this file,
+;   bank 1 = the updater/licence code). Output port C8 selects the bank; the
+;   switch happens inside the routine at 3F0, which exists at the same address
+;   in both banks (see bank_call). Registers and the 64-byte scratchpad are
+;   shared, which is how bank 1 hands results back (scratchpad 3E/3F).
+;
+;   The core resets into bank 0. Bank 1 is entered twice:
+;     - at boot (3F = 0): licence check against the Device DNA; on success
+;       bank 1 leaves 3E=F1, 3F=F2, which unlocks ROM loading here.
+;     - on event 08 (3F = 1): program one 256-byte page of the SPI config flash
+;       (firmware update).
+;
+; FUNCTIONS IN THIS BANK
+;   - SD card bring-up and sector transfers through an SD host controller with
+;     DMA, reached over a Wishbone-style bridge (ports 70-73 + indexed port).
+;     Register layout and command-word format are consistent with the
+;     OpenCores sd_card_controller (Marek Czerski).
+;   - ROM loading from the SD card (cluster by cluster, from the 512-byte
+;     load table written by the Game Boy at $7F36=1).
+;   - PCF8563 real-time clock over bit-banged I2C: init, continuous readout
+;     into the Game Boy RTC window, and setting the time.
+;
+; SD CONTROLLER REGISTERS (Wishbone address = port number used with (sE))
+;   00 argument          04 command (index<<8 | flags)   08-14 response
+;   18 data timeout?     1C bus width (1 = 4-bit)        20 cmd timeout?
+;   24 clock divider     28 software reset               34 cmd event status
+;   38 cmd event enable  3C data event status            40 data event enable
+;   44 block size - 1    48 block count - 1              60 DMA address
+;   Command flags (low byte): b1:0 response (01 = 48-bit, 10 = 136-bit),
+;   b2 busy check, b3 CRC check, b4 index check, b5 read data, b6 write data.
+;   Routine sd_cmd takes "sB" flags: b0 response, b1 long, b2 CRC check,
+;   b3 busy, b4 index check (15 = R1, 1D = R1b, 07 = R2, 01 = R3).
+;
+; INPUT PORTS                               OUTPUT PORTS
+;   00-7F (sE) Wishbone ack, b1:0 != 0        00-7F (sE) Wishbone write strobe
+;   70-73  Wishbone read data (70 = LSB)      70-73  Wishbone write data (70 = LSB)
+;   A0     debug TX status, b2 = busy         A1     debug byte out
+;   B0-B3  sector number ($7FB0-$7FB3)        BF     load-table word index
+;   B4     sector count ($7FB4)               C8     program bank select (1 = bank 1)
+;   B5     event flags (see isr)              E0-E3  ROM-load destination (file sector)
+;   B6     RTC byte written by the GB         EC     I2C out: b0 SCL, b1 SDA (1 = release)
+;   B9     01 while the RTC window is mapped  ED/EE  RTC window index / data
+;   C0-C3  load-table word (C0 = b31:24)      EF     ROM load busy (1 = loading)
+;   EB     I2C in: b0 SCL, b1 SDA             F0     index of RTC byte to fetch on B6
+;   (A2, A3, B7, E4-E7, E9, F2 are only used by unreachable code)
+;
+; SCRATCHPAD
+;   00 ACMD41 retry counter        01 02 = SD v2 card (CMD8 echo ok)
+;   02-05 last response (02 = b31:24 .. 05 = b7:0)
+;   06 01 = high-capacity card (block addressing)
+;   13-16 CID response (first word)    17-18 RCA
+;   19 data phase of next command: 01 read, 02 write
+;   1A-1D DMA address (1A = MSB)       1E-1F block size - 1 (01FF)
+;   20 block count - 1                 2A/31 sectors per cluster (lo/hi)
+;   2C-2F current file sector during ROM load (2F = LSB)
+;   3B load-table page (00 = words 00-7F)   3D last data event status
+;   3E/3F licence flags (F1/F2 = licensed, written by bank 1)
+;   3F also: 01 = "flash page write requested" when entering bank 1
+;==============================================================================
+
+
+            ADDRESS 000
+
+; ------------------------------------------------------------------------------
+; RESET: run the bank-1 boot code (licence check), print the licence flags,
+; bring up the SD card (CMD0, CMD8, ACMD41, CMD2, CMD3, CMD7, CMD16, ACMD6 4-bit),
+; initialise the RTC, then enter the main loop with interrupts enabled.
+; ------------------------------------------------------------------------------
+reset:
+            DISABLE INTERRUPT              ; 000
+            LOAD     s2, 00                ; 001  scratch 3F = 0: bank 1 runs its boot path
+            STORE    s2, 3F                ; 002
+            CALL     bank_call             ; 003  -> bank 1 (licence check, sets 3E/3F)
+            FETCH    sF, 3E                ; 004  debug: licence flags (F1, F2 when ok)
+            CALL     dbg_putc              ; 005
+            FETCH    sF, 3F                ; 006
+            CALL     dbg_putc              ; 007
+            CALL     clear_scratch         ; 008
+            CALL     sdc_init_regs         ; 009  SD controller setup, slow clock
+            CALL     delay_m               ; 00A
+            CALL     sd_cmd0               ; 00B  CMD0
+            LOAD     sF, B0                ; 00C  debug B0
+            CALL     dbg_putc              ; 00D
+            CALL     delay_s               ; 00E
+            CALL     sd_cmd8               ; 00F  CMD8 (SEND_IF_COND 1AA)
+            CALL     sd_get_resp           ; 010
+            FETCH    s0, 05                ; 011  echoed check pattern
+            FETCH    s0, 05                ; 012
+            COMPARE  s0, AA                ; 013  AA = card understood CMD8
+            JUMP     NZ, init_acmd41       ; 014
+            LOAD     s0, 02                ; 015  scratch 01 = 2: SD version 2 card
+            STORE    s0, 01                ; 016
+            JUMP     init_acmd41           ; 017
+init_acmd41:
+            CALL     sd_wait_ready         ; 018  CMD55/ACMD41 until ready
+            CALL     sd_cmd2               ; 019  CMD2 (ALL_SEND_CID)
+            CALL     sd_save_cid           ; 01A  keep CID word
+            CALL     delay_s               ; 01B
+            CALL     sd_cmd3               ; 01C  CMD3 (SEND_RELATIVE_ADDR)
+            CALL     delay_m               ; 01D
+            CALL     sd_get_resp           ; 01E
+            FETCH    s0, 02                ; 01F  RCA = response bits 31:16
+            STORE    s0, 17                ; 020
+            FETCH    s0, 03                ; 021
+            STORE    s0, 18                ; 022
+            LOAD     s0, 00                ; 023  clock divider 0: full speed
+            CALL     sdc_set_clkdiv        ; 024
+            CALL     sdc_reset_off         ; 025  software reset register = 0
+            CALL     sd_cmd7               ; 026  CMD7 (SELECT_CARD)
+            LOAD     s1, 02                ; 027
+            LOAD     s0, 00                ; 028
+            CALL     sd_cmd16              ; 029  CMD16 SET_BLOCKLEN 512
+            CALL     sd_cmd55              ; 02A  CMD55
+            CALL     sd_acmd6              ; 02B  ACMD6: 4-bit bus
+            CALL     sdc_bus4              ; 02C  controller: 4-bit bus
+            CALL     sd_cmd13              ; 02D  CMD13
+            CALL     rtc_init              ; 02E  PCF8563 init
+            LOAD     sF, EE                ; 02F  debug EE: init done
+            CALL     dbg_putc              ; 030
+            ENABLE INTERRUPT               ; 031
+
+; ------------------------------------------------------------------------------
+; MAIN LOOP (FW5 and FW5 SGB beta): every pass copies the PCF8563 time into the
+; Game Boy RTC window (rtc_publish, now unconditional). When B9 = 01 it also runs
+; an MBC3 real-time-clock emulation (mbc3_rtc_update):
+;   - read the PCF8563 seconds; when they change, count one elapsed second in
+;     scratch 33 (s, 0-59), 34 (min, 0-59), 35 (h, 0-23), 36 (days, 8-bit)
+;   - output A5-A9 = MBC3 registers S, M, H, DL, DH = base value (input ports
+;     A5-A9) + elapsed time, with carries; a day overflow sets DH bit 0, or
+;     DH bit 7 (day-counter carry) if bit 0 was already set
+; The elapsed counters are reset by a ROM load (event 20) and, in FW5 SGB beta,
+; when the game writes an MBC3 RTC register. B9 probably means "MBC3 + timer
+; mapper active" here (the kernel selects mapper $83 = MBC3+TIMER).
+; ------------------------------------------------------------------------------
+main_loop:
+            LOAD     sB, 02                ; 032  start at PCF8563 register 2
+            DISABLE INTERRUPT              ; 033  no interrupts during the I2C burst
+            CALL     rtc_publish           ; 034  time -> GB RTC window
+            ENABLE INTERRUPT               ; 035
+
+; mbc3_rtc_update: see the main loop header above.
+mbc3_rtc_update:
+            INPUT    s1, B9                ; 036  MBC3 timer active?
+            COMPARE  s1, 01                ; 037
+            JUMP     NZ, main_idle         ; 038
+            LOAD     sB, 02                ; 039  PCF8563 seconds
+            CALL     rtc_read              ; 03A  read it
+            FETCH    s0, 37                ; 03B  last seen seconds value
+            COMPARE  s0, sD                ; 03C  unchanged: nothing to do
+            JUMP     Z, main_idle          ; 03D
+            STORE    sD, 37                ; 03E  remember it
+            FETCH    s0, 33                ; 03F  elapsed seconds
+            COMPARE  s0, 3B                ; 040  59?
+            JUMP     Z, mbc3_wrap_s        ; 041
+            ADD      s0, 01                ; 042  +1 s
+            STORE    s0, 33                ; 043
+            JUMP     mbc3_compose          ; 044
+mbc3_wrap_s:
+            LOAD     s0, 00                ; 045  wrap seconds
+            STORE    s0, 33                ; 046
+            FETCH    s0, 34                ; 047  elapsed minutes
+            COMPARE  s0, 3B                ; 048
+            JUMP     Z, mbc3_wrap_m        ; 049
+            ADD      s0, 01                ; 04A  +1 min
+            STORE    s0, 34                ; 04B
+            JUMP     mbc3_compose          ; 04C
+mbc3_wrap_m:
+            LOAD     s0, 00                ; 04D  wrap minutes
+            STORE    s0, 34                ; 04E
+            FETCH    s0, 35                ; 04F  elapsed hours
+            COMPARE  s0, 17                ; 050  23?
+            JUMP     Z, mbc3_wrap_h        ; 051
+            ADD      s0, 01                ; 052  +1 h
+            STORE    s0, 35                ; 053
+            JUMP     mbc3_compose          ; 054
+mbc3_wrap_h:
+            LOAD     s0, 00                ; 055  wrap hours
+            STORE    s0, 35                ; 056
+            FETCH    s0, 36                ; 057  elapsed days
+            ADD      s0, 01                ; 058  +1 day
+            STORE    s0, 36                ; 059
+mbc3_compose:
+            FETCH    s5, 33                ; 05A  S: base + elapsed
+            INPUT    s4, A5                ; 05B
+            ADD      s4, s5                ; 05C
+            LOAD     s3, 00                ; 05D
+            LOAD     s5, s4                ; 05E
+            SUB      s5, 3C                ; 05F  mod 60, carry in s3
+            JUMP     C, mbc3_out_s         ; 060
+            SUB      s4, 3C                ; 061
+            ADD      s3, 01                ; 062
+mbc3_out_s:
+            OUTPUT   s4, A5                ; 063  MBC3 S
+            FETCH    s5, 34                ; 064  M: base + elapsed + carry
+            INPUT    s4, A6                ; 065
+            ADD      s4, s5                ; 066
+            ADD      s4, s3                ; 067
+            LOAD     s3, 00                ; 068
+            LOAD     s5, s4                ; 069
+            SUB      s5, 3C                ; 06A
+            JUMP     C, mbc3_out_m         ; 06B
+            SUB      s4, 3C                ; 06C
+            ADD      s3, 01                ; 06D
+mbc3_out_m:
+            OUTPUT   s4, A6                ; 06E  MBC3 M
+            FETCH    s5, 35                ; 06F  H: base + elapsed + carry
+            INPUT    s4, A7                ; 070
+            ADD      s4, s5                ; 071
+            ADD      s4, s3                ; 072
+            LOAD     s3, 00                ; 073
+            LOAD     s5, s4                ; 074
+            SUB      s5, 18                ; 075  mod 24
+            JUMP     C, mbc3_out_h         ; 076
+            SUB      s4, 18                ; 077
+            ADD      s3, 01                ; 078
+mbc3_out_h:
+            OUTPUT   s4, A7                ; 079  MBC3 H
+            FETCH    s5, 36                ; 07A  DL: base + elapsed days
+            INPUT    s4, A8                ; 07B
+            ADD      s4, s5                ; 07C
+            JUMP     C, mbc3_day_overflow  ; 07D  overflow?
+            ADD      s4, s3                ; 07E  + carry from hours
+            JUMP     C, mbc3_day_overflow  ; 07F
+            JUMP     mbc3_no_overflow      ; 080
+mbc3_day_overflow:
+            OUTPUT   s4, A8                ; 081  MBC3 DL (wrapped)
+            INPUT    s4, A9                ; 082  DH
+            TEST     s4, 01                ; 083  day bit 8 already set?
+            JUMP     Z, mbc3_day_bit8      ; 084
+            OR       s4, 80                ; 085  yes: set day-counter carry (b7)
+            OUTPUT   s4, A9                ; 086
+            JUMP     main_idle             ; 087
+mbc3_day_bit8:
+            OR       s4, 01                ; 088  no: set day bit 8
+            OUTPUT   s4, A9                ; 089
+            JUMP     main_idle             ; 08A
+mbc3_no_overflow:
+            OUTPUT   s4, A8                ; 08B  MBC3 DL
+            INPUT    s4, A9                ; 08C  DH unchanged
+            OUTPUT   s4, A9                ; 08D
+main_idle:
+            CALL     delay_l               ; 08E  pause, then repeat
+            JUMP     main_loop             ; 08F
+
+; Unreachable: pulse output port F2.
+            CALL     delay_s               ; 090  [unreachable]
+            LOAD     s1, 00                ; 091  [unreachable]
+            OUTPUT   s1, F2                ; 092  [unreachable]
+            LOAD     s2, 01                ; 093  [unreachable]
+            OUTPUT   s2, F2                ; 094  [unreachable]
+            OUTPUT   s1, F2                ; 095  [unreachable]
+            RETURN                         ; 096  [unreachable]
+
+; clear_scratch: zero scratchpad 00-3D (3E/3F, the licence flags, survive).
+clear_scratch:
+            LOAD     s6, 00                ; 097
+            LOAD     s4, 00                ; 098
+clear_scratch_L02:
+            COMPARE  s4, 3E                ; 099
+            JUMP     C, clear_scratch_L05  ; 09A
+            JUMP     clear_scratch_L08     ; 09B
+clear_scratch_L05:
+            STORE    s6, (s4)              ; 09C
+            ADD      s4, 01                ; 09D
+            JUMP     clear_scratch_L02     ; 09E
+clear_scratch_L08:
+            RETURN                         ; 09F
+
+; ------------------------------------------------------------------------------
+; SD COMMAND WRAPPERS. Each loads sC = command index, sB = response flags,
+; s7-sA = argument (s7 = LSB) and falls into sd_cmd.
+; ------------------------------------------------------------------------------
+; sd_cmd0: GO_IDLE_STATE, no response.
+sd_cmd0:
+            LOAD     sC, 00                ; 0A0
+            LOAD     sB, 00                ; 0A1
+            JUMP     sd_cmd_noarg          ; 0A2
+
+; sd_cmd8: SEND_IF_COND, argument 000001AA (2.7-3.6 V, check pattern AA), R7.
+sd_cmd8:
+            LOAD     sC, 08                ; 0A3
+            LOAD     sB, 15                ; 0A4
+            LOAD     s8, 01                ; 0A5  argument 000001AA
+            LOAD     s7, AA                ; 0A6
+            JUMP     sd_cmd_arg16          ; 0A7
+
+; sd_wait_ready: repeat CMD55 + ACMD41 until the card reports power-up done
+; (OCR bit 31), at most 255 tries. Sets scratch 06 = 01 for a high-capacity card
+; (OCR bit 30, CCS); debug byte 82 = SDHC/SDXC, 88 = SDSC or timeout.
+sd_wait_ready:
+            LOAD     s3, FF                ; 0A8  up to 255 attempts
+            STORE    s3, 00                ; 0A9
+            LOAD     s0, 00                ; 0AA
+            STORE    s0, 17                ; 0AB
+            STORE    s0, 18                ; 0AC
+acmd41_retry:
+            CALL     sd_cmd55              ; 0AD
+            CALL     delay_s               ; 0AE
+            CALL     sd_acmd41             ; 0AF
+            CALL     delay_s               ; 0B0
+            CALL     sd_get_resp           ; 0B1
+            FETCH    s0, 02                ; 0B2  OCR bits 31:24
+            TEST     s0, 80                ; 0B3  bit 31: power-up done
+            JUMP     NZ, acmd41_ready      ; 0B4
+            FETCH    s3, 00                ; 0B5  not ready: count down
+            SUB      s3, 01                ; 0B6
+            STORE    s3, 00                ; 0B7
+            COMPARE  s3, 00                ; 0B8
+            JUMP     Z, acmd41_sdsc        ; 0B9  gave up
+            CALL     delay_l               ; 0BA
+            JUMP     acmd41_retry          ; 0BB
+acmd41_ready:
+            FETCH    s0, 01                ; 0BC
+            COMPARE  s0, 02                ; 0BD
+            JUMP     Z, acmd41_ready_L05   ; 0BE
+            LOAD     s0, 01                ; 0BF  not v2: scratch 01 = 1
+            STORE    s0, 01                ; 0C0
+acmd41_ready_L05:
+            FETCH    s0, 02                ; 0C1
+            TEST     s0, 40                ; 0C2  bit 30: CCS (high capacity)
+            JUMP     Z, acmd41_sdsc        ; 0C3
+            LOAD     s3, 01                ; 0C4  high capacity
+            LOAD     sF, 82                ; 0C5  debug 82
+            CALL     dbg_putc              ; 0C6
+            JUMP     acmd41_done           ; 0C7
+acmd41_sdsc:
+            LOAD     sF, 88                ; 0C8  debug 88
+            CALL     dbg_putc              ; 0C9
+            LOAD     s3, 00                ; 0CA  standard capacity
+acmd41_done:
+            STORE    s3, 06                ; 0CB  scratch 06 = capacity flag
+            RETURN                         ; 0CC
+
+; sd_cmd55: APP_CMD with the card's RCA (R1).
+sd_cmd55:
+            LOAD     sC, 37                ; 0CD  CMD55
+sd_cmd_rca:
+            LOAD     sB, 15                ; 0CE
+            FETCH    sA, 17                ; 0CF  argument = RCA << 16
+            FETCH    s9, 18                ; 0D0
+            JUMP     sd_cmd_arg_hi         ; 0D1
+
+; sd_cmd13: SEND_STATUS with RCA (R1).
+sd_cmd13:
+            LOAD     sC, 0D                ; 0D2  CMD13
+            JUMP     sd_cmd_rca            ; 0D3
+
+; sd_acmd41: SD_SEND_OP_COND, argument 40300000 (HCS + 3.2-3.4 V), R3.
+; The OR at 085 is overwritten by the LOAD at 086, so HCS is always set.
+sd_acmd41:
+            LOAD     sC, 29                ; 0D4  ACMD41 (index 29)
+            LOAD     sB, 01                ; 0D5  R3: response, no CRC check
+            LOAD     sA, 00                ; 0D6
+            FETCH    s0, 01                ; 0D7
+            COMPARE  s0, 02                ; 0D8
+            JUMP     NZ, sd_acmd41_L07     ; 0D9
+            OR       sA, 40                ; 0DA  (dead: overwritten below)
+sd_acmd41_L07:
+            LOAD     sA, 40                ; 0DB  argument 4030_0000
+            LOAD     s9, 30                ; 0DC
+sd_cmd_arg_hi:
+            LOAD     s8, 00                ; 0DD
+            LOAD     s7, 00                ; 0DE
+            CALL     sd_cmd                ; 0DF
+            RETURN                         ; 0E0
+
+; sd_cmd2: ALL_SEND_CID, R2 (136-bit).
+sd_cmd2:
+            LOAD     sC, 02                ; 0E1  CMD2
+            LOAD     sB, 07                ; 0E2  R2 (136-bit, CRC)
+            JUMP     sd_cmd_noarg          ; 0E3
+
+; sd_cmd3: SEND_RELATIVE_ADDR, R6.
+sd_cmd3:
+            LOAD     sC, 03                ; 0E4  CMD3
+            LOAD     sB, 15                ; 0E5
+            JUMP     sd_cmd_noarg          ; 0E6
+
+; sd_cmd7: SELECT_CARD with RCA, R1.
+sd_cmd7:
+            LOAD     sC, 07                ; 0E7  CMD7
+            LOAD     sB, 15                ; 0E8
+            FETCH    sA, 17                ; 0E9
+            FETCH    s9, 18                ; 0EA
+            JUMP     sd_cmd_arg_hi         ; 0EB
+
+; sd_acmd6: SET_BUS_WIDTH, argument 2 (4-bit). Sent after CMD55.
+sd_acmd6:
+            LOAD     sC, 06                ; 0EC  ACMD6
+            LOAD     sB, 15                ; 0ED
+            LOAD     s8, 00                ; 0EE
+            LOAD     s7, 02                ; 0EF  argument 2: 4-bit bus
+            JUMP     sd_cmd_arg16          ; 0F0
+
+; sd_cmd16: SET_BLOCKLEN, argument s1:s0 (called with 0200).
+sd_cmd16:
+            LOAD     sC, 10                ; 0F1  CMD16
+            LOAD     sB, 15                ; 0F2
+            LOAD     s8, s1                ; 0F3
+            LOAD     s7, s0                ; 0F4
+            JUMP     sd_cmd_arg16          ; 0F5
+sd_cmd_noarg:
+            LOAD     s8, 00                ; 0F6
+            LOAD     s7, 00                ; 0F7
+sd_cmd_arg16:
+            LOAD     sA, 00                ; 0F8
+            LOAD     s9, 00                ; 0F9
+            CALL     sd_cmd                ; 0FA
+            RETURN                         ; 0FB
+
+; ------------------------------------------------------------------------------
+; sdc_init_regs: initial SD host controller setup: clear timeouts and event
+; enables/status, 1-bit bus, pulse software reset, clock divider 48 (slow
+; clock for card identification).
+; ------------------------------------------------------------------------------
+sdc_init_regs:
+            CALL     sdc_reg20_clear       ; 0FC  reg 20 = 0
+            CALL     sdc_reg18_clear       ; 0FD  reg 18 = 0
+            CALL     sdc_reg38_clear       ; 0FE  reg 38 = 0 (cmd events off)
+            CALL     sdc_reg40_clear       ; 0FF  reg 40 = 0 (data events off)
+            CALL     sdc_reg34_clear       ; 100  reg 34 = 0 (clear cmd events)
+            CALL     sdc_reg3C_clear       ; 101  reg 3C = 0 (clear data events)
+            LOAD     s0, 00                ; 102
+            CALL     sdc_set_clkdiv        ; 103  reg 24 = 0
+            CALL     sdc_bus1              ; 104  reg 1C = 0: 1-bit bus
+            CALL     sdc_reset_on          ; 105  reg 28 = 1: reset
+            LOAD     s0, 48                ; 106  clock divider 48: slow identification clock
+            CALL     sdc_set_clkdiv        ; 107
+            CALL     sdc_reset_off         ; 108  reg 28 = 0: release reset
+            RETURN                         ; 109
+sdc_reset_on:
+            LOAD     sE, 28                ; 10A
+            CALL     wb_clear_hi           ; 10B
+            JUMP     wb_write_1            ; 10C
+sdc_reg20_clear:
+            LOAD     sE, 20                ; 10D
+            LOAD     sD, 00                ; 10E
+            OUTPUT   sD, 73                ; 10F
+            OUTPUT   sD, 72                ; 110
+            LOAD     s1, 00                ; 111
+            OUTPUT   s1, 71                ; 112
+            OUTPUT   s1, 70                ; 113
+            CALL     wb_write              ; 114
+            RETURN                         ; 115
+sdc_reg18_clear:
+            LOAD     sE, 18                ; 116
+            JUMP     wb_write_0            ; 117
+sdc_set_clkdiv:
+            LOAD     sE, 24                ; 118
+            CALL     wb_clear_hi           ; 119
+            LOAD     sD, s0                ; 11A
+            OUTPUT   sD, 70                ; 11B
+            CALL     wb_write              ; 11C
+            RETURN                         ; 11D
+sdc_reset_off:
+            LOAD     sE, 28                ; 11E
+            JUMP     wb_write_0            ; 11F
+sdc_reg38_clear:
+            LOAD     sE, 38                ; 120
+            JUMP     wb_write_0            ; 121
+sdc_reg34_clear:
+            LOAD     sE, 34                ; 122
+            JUMP     wb_write_0            ; 123
+sdc_reg40_set:
+            LOAD     sE, 40                ; 124
+            CALL     wb_clear_hi           ; 125
+            JUMP     wb_write_1            ; 126
+sdc_reg40_clear:
+            LOAD     sE, 40                ; 127
+            JUMP     wb_write_0            ; 128
+sdc_reg3C_clear:
+            LOAD     sE, 3C                ; 129
+            JUMP     wb_write_0            ; 12A
+sdc_bus4:
+            LOAD     sE, 1C                ; 12B
+            CALL     wb_clear_hi           ; 12C
+
+; wb_write_1 / wb_write_0: write 00000001 / 00000000 to Wishbone register sE.
+wb_write_1:
+            LOAD     s1, 01                ; 12D
+            OUTPUT   s1, 70                ; 12E
+            CALL     wb_write              ; 12F
+            RETURN                         ; 130
+sdc_bus1:
+            LOAD     sE, 1C                ; 131
+            JUMP     wb_write_0            ; 132
+wb_write_0:
+            CALL     wb_clear_hi           ; 133
+            OUTPUT   sD, 70                ; 134
+            CALL     wb_write              ; 135
+            RETURN                         ; 136
+
+; wb_clear_hi: zero the upper three staging bytes (ports 71-73); sD = 0.
+wb_clear_hi:
+            LOAD     sD, 00                ; 137
+            OUTPUT   sD, 73                ; 138
+            OUTPUT   sD, 72                ; 139
+            OUTPUT   sD, 71                ; 13A
+            RETURN                         ; 13B
+
+; ------------------------------------------------------------------------------
+; sd_cmd: send SD command.
+;   in: sC = index, sB = flags (see header), s7-sA = argument (s7 = LSB),
+;       scratch 19 = data phase (01 read, 02 write, 00 none),
+;       1A-1D = DMA address, 1E-1F = block size - 1, 20 = block count - 1.
+; Builds the controller's command word in s0, programs the data registers if a
+; data phase is requested, issues the command, waits for the command event,
+; then (for data commands) waits for the data event.
+; ------------------------------------------------------------------------------
+sd_cmd:
+            LOAD     s0, 00                ; 13C
+            TEST     sB, 01                ; 13D  b0: response expected
+            JUMP     Z, sd_cmd_L08         ; 13E
+            TEST     sB, 02                ; 13F  b1: long response
+            JUMP     Z, sd_cmd_L07         ; 140
+            OR       s0, 02                ; 141  -> 136-bit
+            JUMP     sd_cmd_L08            ; 142
+sd_cmd_L07:
+            OR       s0, 01                ; 143  -> 48-bit
+sd_cmd_L08:
+            TEST     sB, 08                ; 144  sB b3 -> busy check
+            JUMP     Z, sd_cmd_L0B         ; 145
+            OR       s0, 04                ; 146
+sd_cmd_L0B:
+            TEST     sB, 04                ; 147  sB b2 -> CRC check
+            JUMP     Z, sd_cmd_L0E         ; 148
+            OR       s0, 08                ; 149
+sd_cmd_L0E:
+            TEST     sB, 10                ; 14A  sB b4 -> index check
+            JUMP     Z, sd_cmd_L11         ; 14B
+            OR       s0, 10                ; 14C
+sd_cmd_L11:
+            FETCH    s1, 19                ; 14D  data phase?
+            COMPARE  s1, 01                ; 14E
+            JUMP     NZ, sd_cmd_L16        ; 14F
+            OR       s0, 20                ; 150  read data
+            JUMP     sd_cmd_data           ; 151
+sd_cmd_L16:
+            COMPARE  s1, 02                ; 152
+            JUMP     NZ, sd_cmd_issue      ; 153
+            OR       s0, 40                ; 154  write data
+sd_cmd_data:
+            LOAD     sE, 60                ; 155  reg 60: DMA address from scratch 1A-1D
+            FETCH    s1, 1A                ; 156
+            OUTPUT   s1, 73                ; 157
+            FETCH    s1, 1B                ; 158
+            OUTPUT   s1, 72                ; 159
+            FETCH    s1, 1C                ; 15A
+            OUTPUT   s1, 71                ; 15B
+            FETCH    s1, 1D                ; 15C
+            OUTPUT   s1, 70                ; 15D
+            CALL     wb_write              ; 15E
+            LOAD     sE, 44                ; 15F  reg 44: block size - 1
+            LOAD     s1, 00                ; 160
+            OUTPUT   s1, 73                ; 161
+            OUTPUT   s1, 72                ; 162
+            FETCH    s1, 1E                ; 163
+            OUTPUT   s1, 71                ; 164
+            FETCH    s1, 1F                ; 165
+            OUTPUT   s1, 70                ; 166
+            CALL     wb_write              ; 167
+            LOAD     sE, 48                ; 168  reg 48: block count - 1
+            CALL     wb_clear_hi           ; 169
+            FETCH    s1, 20                ; 16A
+            OUTPUT   s1, 70                ; 16B
+            CALL     wb_write              ; 16C
+sd_cmd_issue:
+            LOAD     sE, 04                ; 16D  reg 04: command (index, flags)
+            OUTPUT   sC, 71                ; 16E
+            OUTPUT   s0, 70                ; 16F
+            CALL     wb_write              ; 170
+            LOAD     sE, 00                ; 171  reg 00: argument; this starts the command
+            OUTPUT   sA, 73                ; 172
+            OUTPUT   s9, 72                ; 173
+            OUTPUT   s8, 71                ; 174
+            OUTPUT   s7, 70                ; 175
+            CALL     wb_write              ; 176
+sd_cmd_wait:
+            LOAD     sE, 34                ; 177  wait for command event
+            CALL     wb_wait_ack           ; 178
+            INPUT    s0, 70                ; 179
+            COMPARE  s0, 06                ; 17A  06: error bits
+            JUMP     Z, sd_cmd_done        ; 17B
+            TEST     s0, 01                ; 17C  b0: command complete
+            JUMP     Z, sd_cmd_wait        ; 17D
+sd_cmd_done:
+            LOAD     sE, 34                ; 17E  clear command events
+            LOAD     sD, 00                ; 17F
+            OUTPUT   sD, 70                ; 180
+            CALL     wb_write              ; 181
+            FETCH    s1, 19                ; 182  data phase?
+            COMPARE  s1, 00                ; 183
+            JUMP     Z, sd_cmd_ret         ; 184
+            LOAD     sF, 55                ; 185  debug 55
+            CALL     dbg_putc              ; 186
+sd_data_wait:
+            LOAD     sE, 3C                ; 187  wait for data event (b0 = transfer complete)
+            CALL     wb_wait_ack           ; 188
+            INPUT    s3, 70                ; 189
+            TEST     s3, 01                ; 18A
+            JUMP     Z, sd_data_wait       ; 18B
+            STORE    s3, 3D                ; 18C  keep data status
+            LOAD     sE, 3C                ; 18D  clear data events
+            LOAD     sD, 00                ; 18E
+            OUTPUT   sD, 70                ; 18F
+            CALL     wb_write              ; 190
+            LOAD     s1, 00                ; 191  data phase done
+            STORE    s1, 19                ; 192
+sd_cmd_ret:
+            RETURN                         ; 193
+
+; sd_get_resp: read response register 08 into scratch 02-05 (02 = MSB).
+sd_get_resp:
+            LOAD     sE, 08                ; 194  register 08 = response
+            JUMP     sd_get_resp_L02       ; 195
+sd_get_resp_L02:
+            CALL     wb_wait_ack           ; 196
+            INPUT    s6, 73                ; 197
+            STORE    s6, 02                ; 198
+            INPUT    s5, 72                ; 199
+            STORE    s5, 03                ; 19A
+            INPUT    s4, 71                ; 19B
+            STORE    s4, 04                ; 19C
+            INPUT    s3, 70                ; 19D
+            STORE    s3, 05                ; 19E
+            RETURN                         ; 19F
+
+; sd_save_cid: read the response and copy it to scratch 13-16.
+sd_save_cid:
+            CALL     sd_get_resp           ; 1A0
+            FETCH    s0, 05                ; 1A1
+            STORE    s0, 16                ; 1A2
+            FETCH    s0, 04                ; 1A3
+            STORE    s0, 15                ; 1A4
+            FETCH    s0, 03                ; 1A5
+            STORE    s0, 14                ; 1A6
+            FETCH    s0, 02                ; 1A7
+            STORE    s0, 13                ; 1A8
+            RETURN                         ; 1A9
+
+; ------------------------------------------------------------------------------
+; dbg_putc: send sF to the debug output (port A1) once A0 bit 2 is clear.
+; Probably a UART or similar; the codes it sends are progress markers.
+; ------------------------------------------------------------------------------
+dbg_putc:
+            INPUT    s0, A0                ; 1AA  debug TX busy?
+            TEST     s0, 04                ; 1AB
+            JUMP     NZ, dbg_putc          ; 1AC
+            OUTPUT   sF, A1                ; 1AD  send byte
+            RETURN                         ; 1AE
+
+; wb_write: write the 32-bit value staged in ports 70-73 to Wishbone register
+; sE (the port number is the register address), then wait for the ack.
+; wb_wait_ack: wait until reading register sE returns b1:0 != 0 (also used on
+; its own to start a register read; data then appears on input ports 70-73).
+wb_write:
+            OUTPUT   sD, (sE)              ; 1AF  start write cycle to register sE
+            JUMP     wb_wait_ack           ; 1B0
+wb_wait_ack:
+            INPUT    sD, (sE)              ; 1B1  read register sE
+            TEST     sD, 03                ; 1B2  ack/done bits
+            JUMP     Z, wb_wait_ack        ; 1B3
+            RETURN                         ; 1B4
+
+; ------------------------------------------------------------------------------
+; DELAYS (nested countdown loops; instruction counts measured by emulation):
+;   delay_s  ~1.1k instr   delay_m ~27k   delay_l ~543k   delay_l_half ~271k
+; ------------------------------------------------------------------------------
+delay_tiny:
+            LOAD     s0, 03                ; 1B5  [unreachable]
+delay_tiny_L01:
+            SUB      s0, 01                ; 1B6  [unreachable]
+            JUMP     NZ, delay_tiny_L01    ; 1B7  [unreachable]
+            RETURN                         ; 1B8  [unreachable]
+delay_11:
+            LOAD     s0, 0B                ; 1B9
+delay_11_L01:
+            SUB      s0, 01                ; 1BA
+            JUMP     NZ, delay_11_L01      ; 1BB
+            RETURN                         ; 1BC
+delay_s:
+            LOAD     s1, 28                ; 1BD
+delay_s_L01:
+            CALL     delay_11              ; 1BE
+            SUB      s1, 01                ; 1BF
+            JUMP     NZ, delay_s_L01       ; 1C0
+            RETURN                         ; 1C1
+delay_m:
+            LOAD     s2, 19                ; 1C2
+delay_m_L01:
+            CALL     delay_s               ; 1C3
+            SUB      s2, 01                ; 1C4
+            JUMP     NZ, delay_m_L01       ; 1C5
+            RETURN                         ; 1C6
+delay_l:
+            LOAD     s3, 14                ; 1C7
+delay_l_L01:
+            CALL     delay_m               ; 1C8
+            SUB      s3, 01                ; 1C9
+            JUMP     NZ, delay_l_L01       ; 1CA
+            RETURN                         ; 1CB
+delay_l_half:
+            LOAD     s3, 0A                ; 1CC  [unreachable]
+delay_l_half_L01:
+            CALL     delay_m               ; 1CD  [unreachable]
+            SUB      s3, 01                ; 1CE  [unreachable]
+            JUMP     NZ, delay_l_half_L01  ; 1CF  [unreachable]
+            RETURN                         ; 1D0  [unreachable]
+delay_xl:
+            LOAD     s4, 19                ; 1D1  [unreachable]
+delay_xl_L01:
+            CALL     delay_l               ; 1D2  [unreachable]
+            SUB      s4, 01                ; 1D3  [unreachable]
+            JUMP     NZ, delay_xl_L01      ; 1D4  [unreachable]
+            RETURN                         ; 1D5  [unreachable]
+
+; ------------------------------------------------------------------------------
+; SECTOR TRANSFERS. In: s7-sA = card address, scratch 20 = block count - 1.
+; DMA address = 0, i.e. the start of the 2 KB sector buffer the Game Boy sees
+; at $A000 ($7F30 = 01).
+; sd_read_multi:  CMD18 READ_MULTIPLE_BLOCK
+; sd_write_multi: CMD25 WRITE_MULTIPLE_BLOCK
+; sd_write_single: CMD24 (only reachable via fall-through, unused)
+; ------------------------------------------------------------------------------
+sd_read_multi:
+            LOAD     sC, 12                ; 1D6  CMD18
+            LOAD     s1, 01                ; 1D7  data phase: read
+sd_xfer_dir:
+            STORE    s1, 19                ; 1D8
+            CALL     sd_xfer_start         ; 1D9
+            RETURN                         ; 1DA
+sd_write_single:
+            LOAD     sC, 18                ; 1DB  [unreachable] CMD24
+sd_write_single_L01:
+            LOAD     s1, 02                ; 1DC  data phase: write
+            JUMP     sd_xfer_dir           ; 1DD
+sd_write_multi:
+            LOAD     sC, 19                ; 1DE  CMD25
+            JUMP     sd_write_single_L01   ; 1DF
+
+; sd_xfer_start: DMA address 0, block size 512, enable data events, then send
+; the command with an R1 response. (No 99 + address debug output in this
+; version.)
+sd_xfer_start:
+            LOAD     s1, 00                ; 1E0
+            STORE    s1, 1C                ; 1E1  DMA address = 0
+            STORE    s1, 1A                ; 1E2
+            STORE    s1, 1B                ; 1E3
+            STORE    s1, 1D                ; 1E4
+            LOAD     s1, 01                ; 1E5  block size - 1 = 01FF
+            STORE    s1, 1E                ; 1E6
+            LOAD     s1, FF                ; 1E7
+            STORE    s1, 1F                ; 1E8
+            FETCH    s1, 20                ; 1E9
+            CALL     sdc_reg40_set         ; 1EA  reg 40 = 1: data events on
+            LOAD     sB, 15                ; 1EB  R1
+            CALL     sd_cmd                ; 1EC
+            RETURN                         ; 1ED
+
+; sd_cmd12: STOP_TRANSMISSION, R1b.
+sd_cmd12:
+            LOAD     sC, 0C                ; 1EE  CMD12
+            LOAD     sB, 1D                ; 1EF  R1b
+            CALL     sd_cmd_noarg          ; 1F0
+            RETURN                         ; 1F1
+
+; ------------------------------------------------------------------------------
+; rom_load (event 20, Game Boy $7F36 = 03): as in FW4, with one addition:
+; port BB is sampled into scratch 2B at the start, and the per-cluster wait
+; (delay_l) is skipped when it reads 11. BB probably mirrors $7FBB; its meaning
+; is not known.
+; ------------------------------------------------------------------------------
+rom_load:
+            FETCH    sF, 3E                ; 1F2  debug: licence flags
+            CALL     dbg_putc              ; 1F3
+            FETCH    sF, 3F                ; 1F4
+            CALL     dbg_putc              ; 1F5
+            FETCH    s0, 3E                ; 1F6  licensed?
+            COMPARE  s0, F1                ; 1F7
+            RETURN NZ                      ; 1F8
+            FETCH    s0, 3F                ; 1F9
+            COMPARE  s0, F2                ; 1FA
+            RETURN NZ                      ; 1FB
+            LOAD     s5, 7E                ; 1FC  table word 7E: sectors per cluster
+            CALL     table_read            ; 1FD
+            STORE    s0, 2A                ; 1FE
+            STORE    s1, 31                ; 1FF
+            SUB      s0, 01                ; 200  block count - 1 = one cluster
+            STORE    s0, 20                ; 201
+            LOAD     s5, 7D                ; 202  table word 7D must be 1
+            CALL     table_read            ; 203
+            COMPARE  s0, 01                ; 204
+            JUMP     Z, rom_load_go        ; 205
+            RETURN                         ; 206
+rom_load_go:
+            LOAD     s0, 01                ; 207  busy flag for the GB-visible status
+            OUTPUT   s0, EF                ; 208
+            INPUT    s0, BB                ; 209  sample port BB
+            STORE    s0, 2B                ; 20A
+            CALL     rom_load_file         ; 20B
+            LOAD     s0, 00                ; 20C  done
+            OUTPUT   s0, EF                ; 20D
+            RETURN                         ; 20E
+rom_load_file:
+            LOAD     s0, 00                ; 20F  start at file sector 0
+            STORE    s0, 2C                ; 210
+            STORE    s0, 2D                ; 211
+            STORE    s0, 2E                ; 212
+            STORE    s0, 2F                ; 213
+            LOAD     s1, 00                ; 214  load-table page 0
+            STORE    s1, 3B                ; 215
+rom_load_cluster:
+            FETCH    s7, 2F                ; 216  tell the destination which file sector comes next
+            OUTPUT   s7, E0                ; 217
+            FETCH    s8, 2E                ; 218
+            OUTPUT   s8, E1                ; 219
+            FETCH    s9, 2D                ; 21A
+            OUTPUT   s9, E2                ; 21B
+            FETCH    sA, 2C                ; 21C
+            OUTPUT   sA, E3                ; 21D
+            CALL     map_sector            ; 21E  file sector -> card address
+            CALL     sd_read_multi         ; 21F  read one cluster
+            CALL     sd_cmd12              ; 220  stop
+            FETCH    s0, 2B                ; 221  BB = 11: skip the per-cluster wait
+            COMPARE  s0, 11                ; 222
+            JUMP     Z, rom_load_next      ; 223
+            CALL     delay_l               ; 224  wait (lets the cluster drain into cartridge memory?)
+rom_load_next:
+            FETCH    s7, 2F                ; 225  file sector += sectors per cluster
+            FETCH    s8, 2E                ; 226
+            FETCH    s9, 2D                ; 227
+            FETCH    sA, 2C                ; 228
+            FETCH    s0, 2A                ; 229
+            FETCH    s1, 31                ; 22A
+            ADD      s7, s0                ; 22B
+            ADDCY    s8, s1                ; 22C
+            ADDCY    s9, 00                ; 22D
+            ADDCY    sA, 00                ; 22E
+            STORE    s7, 2F                ; 22F
+            STORE    s8, 2E                ; 230
+            STORE    s9, 2D                ; 231
+            STORE    sA, 2C                ; 232
+            LOAD     s5, 7C                ; 233  table word 7C: file size
+            CALL     table_read            ; 234
+            SL0      s7                    ; 235  file sector * 2 < size / 256  <=>  file sector * 512 < size
+            SLA      s8                    ; 236
+            SLA      s9                    ; 237
+            SLA      sA                    ; 238
+            SUB      s7, s1                ; 239
+            SUBCY    s8, s2                ; 23A
+            SUBCY    s9, s3                ; 23B
+            JUMP     C, rom_load_cluster   ; 23C  more to load
+            RETURN                         ; 23D
+
+; ------------------------------------------------------------------------------
+; table_page / table_read: read 32-bit word s5 (+ page offset from scratch 3B)
+; of the load table into s3:s2:s1:s0 (s0 = LSB) via port BF and C0-C3.
+; ------------------------------------------------------------------------------
+table_page:
+            LOAD     s5, s6                ; 23E
+            FETCH    s4, 3B                ; 23F  page select
+            COMPARE  s4, 00                ; 240
+            JUMP     Z, table_page_L09     ; 241
+            COMPARE  s4, FF                ; 242
+            JUMP     Z, table_page_L08     ; 243
+            ADD      s5, C0                ; 244  page C0
+            RETURN                         ; 245
+table_page_L08:
+            ADD      s5, 80                ; 246  page 80
+table_page_L09:
+            RETURN                         ; 247
+table_read:
+            OUTPUT   s5, BF                ; 248  word index
+            LOAD     s1, s1                ; 249
+            LOAD     s1, s1                ; 24A
+            LOAD     s1, s1                ; 24B
+            INPUT    s3, C0                ; 24C  b31:24
+            INPUT    s2, C1                ; 24D
+            INPUT    s1, C2                ; 24E
+            INPUT    s0, C3                ; 24F  b7:0
+            RETURN                         ; 250
+
+; ------------------------------------------------------------------------------
+; map_sector: translate a file sector offset (s7-sA) into an LBA using the
+; {offset, LBA} pairs: find the last pair whose offset <= file sector, then
+; LBA = pair.LBA + (file sector - pair.offset). Converts to a byte address for
+; standard-capacity cards (lba_to_addr).
+; ------------------------------------------------------------------------------
+map_sector:
+            LOAD     s6, 02                ; 251  pair index 2, 4, 6, ...
+map_sector_L01:
+            CALL     table_page            ; 252
+            CALL     table_read            ; 253
+            LOAD     s4, s7                ; 254  compare file sector with pair offset
+            SUB      s4, s0                ; 255
+            LOAD     s4, s8                ; 256
+            SUBCY    s4, s1                ; 257
+            LOAD     s4, s9                ; 258
+            SUBCY    s4, s2                ; 259
+            LOAD     s4, sA                ; 25A
+            SUBCY    s4, s3                ; 25B
+            JUMP     C, map_sector_L10     ; 25C  file sector < offset: use previous pair
+            COMPARE  s6, 7C                ; 25D  end of table
+            JUMP     Z, map_sector_L12     ; 25E
+            ADD      s6, 02                ; 25F
+            JUMP     map_sector_L01        ; 260
+map_sector_L10:
+            SUB      s6, 02                ; 261
+            JUMP     map_sector_L13        ; 262
+map_sector_L12:
+            LOAD     s6, 00                ; 263  end of table reached: fall back to pair 0
+map_sector_L13:
+            CALL     table_page            ; 264
+            CALL     table_read            ; 265
+            SUB      s7, s0                ; 266  file sector - offset
+            SUBCY    s8, s1                ; 267
+            SUBCY    s9, s2                ; 268
+            SUBCY    sA, s3                ; 269
+            ADD      s6, 01                ; 26A
+            CALL     table_page            ; 26B
+            CALL     table_read            ; 26C
+            ADD      s7, s0                ; 26D  + LBA
+            ADDCY    s8, s1                ; 26E
+            ADDCY    s9, s2                ; 26F
+            ADDCY    sA, s3                ; 270
+            CALL     lba_to_addr           ; 271
+            RETURN                         ; 272
+
+; lba_to_addr: for SDSC cards (scratch 06 != 1) multiply s7-sA by 512.
+lba_to_addr:
+            FETCH    s4, 06                ; 273
+            COMPARE  s4, 01                ; 274  high capacity: block address as is
+            JUMP     Z, lba_to_addr_L0A    ; 275
+            LOAD     sA, s9                ; 276  SDSC: byte address = sector * 512
+            LOAD     s9, s8                ; 277
+            LOAD     s8, s7                ; 278
+            SL0      s8                    ; 279
+            SLA      s9                    ; 27A
+            SLA      sA                    ; 27B
+            LOAD     s7, 00                ; 27C
+lba_to_addr_L0A:
+            RETURN                         ; 27D
+
+; get_gb_sector: s7-sA = sector number from $7FB0-$7FB3 (converted for SDSC),
+; scratch 20 = ($7FB4 count) - 1. (Bit 7 of $7FB4, the write flag, is presumably
+; removed by the hardware, which reports it as event 40 instead.)
+get_gb_sector:
+            INPUT    sA, B3                ; 27E  $7FB3
+            INPUT    s9, B2                ; 27F
+            INPUT    s8, B1                ; 280
+            INPUT    s7, B0                ; 281  $7FB0
+            CALL     lba_to_addr           ; 282
+            INPUT    s1, B4                ; 283  $7FB4
+            SUB      s1, 01                ; 284
+            STORE    s1, 20                ; 285  block count - 1
+            RETURN                         ; 286
+
+; Unreachable: pulse port E9.
+old_pulse_e9:
+            LOAD     s0, 00                ; 287  [unreachable]
+            OUTPUT   s0, E9                ; 288  [unreachable]
+            LOAD     s0, 01                ; 289  [unreachable]
+            OUTPUT   s0, E9                ; 28A  [unreachable]
+            CALL     delay_tiny            ; 28B  [unreachable]
+            LOAD     s0, 00                ; 28C  [unreachable]
+            OUTPUT   s0, E9                ; 28D  [unreachable]
+            LOAD     s0, 00                ; 28E  [unreachable]
+            RETURN                         ; 28F  [unreachable]
+
+; ------------------------------------------------------------------------------
+; BIT-BANGED I2C on port EC (b0 SCL, b1 SDA, sF = shadow) / EB (inputs).
+; SCL high waits for the line to actually rise (clock stretching).
+; i2c_write_byte: s5 MSB first.  i2c_read_byte: 8 bits into s5.
+; i2c_get_ack: clock in the ACK bit; returns carry = 1 on NACK.
+; ------------------------------------------------------------------------------
+i2c_idle:
+            LOAD     sF, 01                ; 290  SCL and SDA released
+            OR       sF, 02                ; 291
+            OUTPUT   sF, EC                ; 292
+            RETURN                         ; 293
+i2c_start:
+            CALL     i2c_sda_high          ; 294
+            CALL     i2c_scl_high          ; 295
+            CALL     i2c_delay5            ; 296
+            CALL     i2c_sda_low           ; 297  SDA low while SCL high = START
+            CALL     i2c_delay4            ; 298
+            CALL     i2c_scl_low           ; 299
+            RETURN                         ; 29A
+i2c_stop:
+            CALL     i2c_sda_low           ; 29B
+            CALL     i2c_delay5            ; 29C
+            CALL     i2c_scl_high          ; 29D
+            CALL     i2c_delay4            ; 29E
+            CALL     i2c_sda_high          ; 29F  SDA high while SCL high = STOP
+            RETURN                         ; 2A0
+i2c_write_byte:
+            LOAD     s1, 80                ; 2A1  bit mask
+i2c_write_byte_L01:
+            TEST     s5, s1                ; 2A2
+            JUMP     NZ, i2c_write_byte_L05 ; 2A3
+            CALL     i2c_sda_low           ; 2A4  bit = 0
+            JUMP     i2c_write_byte_L06    ; 2A5
+i2c_write_byte_L05:
+            CALL     i2c_sda_high          ; 2A6  bit = 1
+i2c_write_byte_L06:
+            CALL     i2c_clock             ; 2A7
+            SR0      s1                    ; 2A8  next bit; carry out after bit 0
+            RETURN C                       ; 2A9
+            JUMP     i2c_write_byte_L01    ; 2AA
+i2c_read_byte:
+            LOAD     s1, 08                ; 2AB  8 bits
+i2c_read_byte_L01:
+            CALL     i2c_read_bit          ; 2AC
+            SUB      s1, 01                ; 2AD
+            JUMP     NZ, i2c_read_byte_L01 ; 2AE
+            RETURN                         ; 2AF
+i2c_ack:
+            CALL     i2c_sda_low           ; 2B0  ACK = SDA low
+i2c_clock:
+            CALL     i2c_delay5            ; 2B1
+            CALL     i2c_scl_high          ; 2B2
+            CALL     i2c_delay4            ; 2B3
+            CALL     i2c_scl_low           ; 2B4
+            RETURN                         ; 2B5
+i2c_nack:
+            CALL     i2c_sda_high          ; 2B6  NACK = SDA high
+            JUMP     i2c_clock             ; 2B7
+i2c_get_ack:
+            CALL     i2c_read_bit          ; 2B8
+            TEST     s5, 01                ; 2B9  carry = ACK bit (1 = NACK)
+            RETURN                         ; 2BA
+i2c_scl_low:
+            AND      sF, 02                ; 2BB  SCL low
+            OUTPUT   sF, EC                ; 2BC
+            CALL     i2c_delay5            ; 2BD
+            RETURN                         ; 2BE
+i2c_scl_high:
+            OR       sF, 01                ; 2BF  release SCL
+            OUTPUT   sF, EC                ; 2C0
+i2c_scl_high_L02:
+            INPUT    s0, EB                ; 2C1  wait until SCL is high (stretching)
+            TEST     s0, 01                ; 2C2
+            JUMP     Z, i2c_scl_high_L02   ; 2C3
+            RETURN                         ; 2C4
+i2c_sda_low:
+            AND      sF, 01                ; 2C5  SDA low
+            OUTPUT   sF, EC                ; 2C6
+            RETURN                         ; 2C7
+i2c_sda_high:
+            OR       sF, 02                ; 2C8  release SDA
+            OUTPUT   sF, EC                ; 2C9
+            RETURN                         ; 2CA
+i2c_read_bit:
+            CALL     i2c_sda_high          ; 2CB
+            CALL     i2c_delay5            ; 2CC
+            CALL     i2c_scl_high          ; 2CD
+            CALL     i2c_delay2            ; 2CE
+            INPUT    s0, EB                ; 2CF  sample SDA
+            TEST     s0, 02                ; 2D0
+            SLA      s5                    ; 2D1  shift into s5
+            CALL     i2c_delay2            ; 2D2
+            CALL     i2c_scl_low           ; 2D3
+            RETURN                         ; 2D4
+i2c_delay5:
+            CALL     i2c_delay1            ; 2D5
+i2c_delay4:
+            CALL     i2c_delay1            ; 2D6
+            CALL     i2c_delay1            ; 2D7
+i2c_delay2:
+            CALL     i2c_delay1            ; 2D8
+            CALL     i2c_delay1            ; 2D9
+            RETURN                         ; 2DA
+i2c_delay1:
+            LOAD     s0, 01                ; 2DB
+i2c_delay1_L01:
+            SUB      s0, 01                ; 2DC
+            JUMP     NZ, i2c_delay1_L01    ; 2DD
+            RETURN                         ; 2DE
+
+; ------------------------------------------------------------------------------
+; PCF8563 RTC ACCESS (I2C address 51: A2 write, A3 read)
+; rtc_write0: register sB = 00.  rtc_write: register sB = sD.
+; rtc_select_read: START, A2, register sB, repeated START, A3.
+; rtc_read: sD = register sB.
+; ------------------------------------------------------------------------------
+rtc_write0:
+            LOAD     sD, 00                ; 2DF  value 00
+rtc_write:
+            CALL     i2c_idle              ; 2E0
+            CALL     i2c_start             ; 2E1
+            LOAD     s5, 51                ; 2E2  device address 51 << 1 = A2 (write)
+            SL0      s5                    ; 2E3
+            CALL     i2c_write_byte        ; 2E4
+            CALL     i2c_get_ack           ; 2E5
+            RETURN C                       ; 2E6  abort on NACK
+            LOAD     s5, sB                ; 2E7  register number
+            CALL     i2c_write_byte        ; 2E8
+            CALL     i2c_get_ack           ; 2E9
+            RETURN C                       ; 2EA
+            LOAD     s5, sD                ; 2EB  value
+            CALL     i2c_write_byte        ; 2EC
+            CALL     i2c_get_ack           ; 2ED
+            RETURN C                       ; 2EE
+            CALL     i2c_stop              ; 2EF  STOP
+            RETURN                         ; 2F0
+rtc_select_read:
+            CALL     i2c_idle              ; 2F1
+            CALL     i2c_start             ; 2F2
+            LOAD     s5, 51                ; 2F3
+            SL0      s5                    ; 2F4
+            CALL     i2c_write_byte        ; 2F5
+            CALL     i2c_get_ack           ; 2F6
+            RETURN C                       ; 2F7
+            LOAD     s5, sB                ; 2F8
+            CALL     i2c_write_byte        ; 2F9
+            CALL     i2c_get_ack           ; 2FA
+            RETURN C                       ; 2FB
+            CALL     i2c_start             ; 2FC
+            LOAD     s5, 51                ; 2FD
+            SL1      s5                    ; 2FE  A3 (read)
+            CALL     i2c_write_byte        ; 2FF
+            CALL     i2c_get_ack           ; 300
+            RETURN C                       ; 301
+            RETURN                         ; 302
+rtc_read:
+            CALL     rtc_select_read       ; 303
+            CALL     i2c_read_byte         ; 304
+            LOAD     sD, s5                ; 305
+rtc_read_L03:
+            CALL     i2c_nack              ; 306
+            CALL     i2c_stop              ; 307
+            RETURN                         ; 308
+
+; rtc_publish: burst-read PCF8563 registers 2-8 (seconds .. years) and write
+; each into the Game Boy RTC window: ED = register number, EE = value
+; (the window shows them at $Ax08-$Ax0E).
+rtc_publish:
+            CALL     rtc_select_read       ; 309
+rtc_publish_L01:
+            CALL     i2c_read_byte         ; 30A
+            OUTPUT   sB, ED                ; 30B  window index
+            OUTPUT   s5, EE                ; 30C  window data
+            COMPARE  sB, 08                ; 30D  last register (years)?
+            JUMP     Z, rtc_read_L03       ; 30E
+            ADD      sB, 01                ; 30F
+            CALL     i2c_ack               ; 310  ACK, read next
+            JUMP     rtc_publish_L01       ; 311
+
+; rtc_set_from_gb (event 10, $7FD0 = 01): for registers 2-8, select the byte
+; via F0, read what the Game Boy wrote (B6) and store it in the PCF8563.
+rtc_set_from_gb:
+            LOAD     sB, 02                ; 312  first register: seconds
+rtc_set_from_gb_L01:
+            OUTPUT   sB, F0                ; 313  select byte sB of the GB data
+            LOAD     s0, s0                ; 314
+            INPUT    sD, B6                ; 315  byte the GB wrote
+            CALL     rtc_write             ; 316  store in RTC
+            COMPARE  sB, 08                ; 317
+            RETURN Z                       ; 318
+            ADD      sB, 01                ; 319
+            JUMP     rtc_set_from_gb_L01   ; 31A
+
+; rtc_init (FW5 and FW5 SGB beta): control 1 = 00 (run); no longer stops the
+; clock or sets CLKOUT on every boot. If the VL (clock integrity) flag is set:
+; reset the clock to year 00, month 01, weekday 03, day 01, 00:00:00.
+rtc_init:
+            LOAD     sB, 00                ; 31B  control 1 = 20: STOP
+            CALL     rtc_write0            ; 31C
+            LOAD     sB, 02                ; 31D  seconds register
+            CALL     rtc_read              ; 31E
+            AND      sD, 80                ; 31F  VL flag: clock integrity lost?
+            COMPARE  sD, 80                ; 320
+            RETURN NZ                      ; 321
+            LOAD     sB, 00                ; 322  stop clock
+            LOAD     sD, 20                ; 323
+            CALL     rtc_write             ; 324
+            LOAD     sB, 08                ; 325  years = 00
+            CALL     rtc_write0            ; 326
+            LOAD     sB, 07                ; 327  months = 01
+            LOAD     sD, 01                ; 328
+            CALL     rtc_write             ; 329
+            LOAD     sB, 06                ; 32A  weekdays = 03
+            LOAD     sD, 03                ; 32B
+            CALL     rtc_write             ; 32C
+            LOAD     sB, 05                ; 32D  days = 01
+            LOAD     sD, 01                ; 32E
+            CALL     rtc_write             ; 32F
+            LOAD     sB, 04                ; 330  hours = 00
+            CALL     rtc_write0            ; 331
+            LOAD     sB, 03                ; 332  minutes = 00
+            CALL     rtc_write0            ; 333
+            LOAD     sB, 02                ; 334  seconds = 00 (clears VL)
+            CALL     rtc_write0            ; 335
+            LOAD     sB, 01                ; 336  control 2 = 00
+            CALL     rtc_write0            ; 337
+            LOAD     sB, 00                ; 338  control 1 = 00: run
+            CALL     rtc_write0            ; 339
+            RETURN                         ; 33A
+
+; ------------------------------------------------------------------------------
+; sd_wait_tran: CMD13 until the card status (bits 15:8) is 09 = state "tran"
+; and ready-for-data; otherwise send CMD12 and retry.
+; ------------------------------------------------------------------------------
+sd_wait_tran:
+            CALL     sd_cmd13              ; 33B  CMD13 SEND_STATUS
+            CALL     sd_get_resp           ; 33C
+            FETCH    s0, 04                ; 33D  status bits 15:8
+            COMPARE  s0, 09                ; 33E  09 = tran, ready for data
+            JUMP     NZ, sd_wait_tran_L06  ; 33F
+            RETURN                         ; 340
+sd_wait_tran_L06:
+            CALL     sd_cmd12              ; 341  not ready: CMD12 and retry
+            JUMP     sd_wait_tran          ; 342
+
+; ------------------------------------------------------------------------------
+; ISR (FW5): debug DD, then the event byte, then dispatch on B5
+;   80 read sectors, 40 write sectors, 20 ROM load (also clears the MBC3
+;   elapsed counters), 10 set RTC (debug AA), 08 flash page write (bank 1)
+; ------------------------------------------------------------------------------
+isr:
+            LOAD     sF, DD                ; 343  debug DD
+            CALL     dbg_putc              ; 344
+
+; isr_events: dispatch on B5 (see the ISR header above).
+isr_events:
+            INPUT    s3, B5                ; 345  event flags
+            LOAD     sF, s3                ; 346  debug: event byte
+            CALL     dbg_putc              ; 347
+            COMPARE  s3, 80                ; 348  read sectors
+            JUMP     NZ, isr_L08           ; 349
+            CALL     sd_wait_tran          ; 34A  card ready
+            CALL     get_gb_sector         ; 34B  LBA and count from $7FB0-$7FB4
+            CALL     sd_read_multi         ; 34C  CMD18 into the sector buffer
+            CALL     sd_cmd12              ; 34D  CMD12
+            JUMP     isr_exit              ; 34E
+isr_L08:
+            COMPARE  s3, 40                ; 34F  write sectors
+            JUMP     NZ, isr_L0F           ; 350
+            CALL     sd_wait_tran          ; 351
+            CALL     get_gb_sector         ; 352
+            CALL     sd_write_multi        ; 353  CMD25 from the sector buffer
+            CALL     sd_cmd12              ; 354
+            JUMP     isr_exit              ; 355
+isr_L0F:
+            COMPARE  s3, 20                ; 356  ROM load
+            JUMP     NZ, isr_L13           ; 357
+            CALL     rom_load              ; 358
+            LOAD     s4, 00                ; 359  clear MBC3 elapsed counters
+            STORE    s4, 33                ; 35A
+            STORE    s4, 34                ; 35B
+            STORE    s4, 35                ; 35C
+            STORE    s4, 36                ; 35D
+            JUMP     isr_exit              ; 35E
+isr_L13:
+            COMPARE  s3, 10                ; 35F  set RTC
+            JUMP     NZ, isr_L17           ; 360
+            LOAD     sF, AA                ; 361  debug AA
+            CALL     dbg_putc              ; 362
+            CALL     rtc_set_from_gb       ; 363
+            JUMP     isr_exit              ; 364
+isr_L17:
+            COMPARE  s3, 08                ; 365  flash page write
+            JUMP     NZ, isr_exit          ; 366
+            LOAD     s2, 01                ; 367  scratch 3F = 1: bank 1 takes the update path
+            STORE    s2, 3F                ; 368
+            CALL     bank_call             ; 369  -> bank 1
+            JUMP     isr_exit              ; 36A
+isr_exit:
+            RETURNI  ENABLE                ; 36B
+
+            ADDRESS 3F0
+
+; ------------------------------------------------------------------------------
+; bank_call: switch to program bank 1 and back. Bank 1 has the same eight
+; instructions here, except that its 3F3 is "CALL 1B5" (bank-1 dispatcher).
+; Writing 1 to C8 switches banks; the NOPs (LOAD s0, s0) cover the fetch
+; pipeline, so execution continues at 3F3 in bank 1, calls the bank-1 code, and
+; returns to 3F4, where C8 = 0 switches back. In this bank 3F3 is only a NOP.
+; ------------------------------------------------------------------------------
+bank_call:
+            LOAD     s0, 01                ; 3F0
+            OUTPUT   s0, C8                ; 3F1  select bank 1
+            LOAD     s0, s0                ; 3F2  NOP (pipeline)
+            LOAD     s0, s0                ; 3F3  NOP here; CALL 1B5 in bank 1
+            LOAD     s0, 00                ; 3F4
+            OUTPUT   s0, C8                ; 3F5  select bank 0
+            LOAD     s0, s0                ; 3F6  NOP (pipeline)
+            RETURN                         ; 3F7
+            LOAD     s0, 00                ; 3F8  [unreachable]
+            LOAD     s0, 00                ; 3F9  [unreachable]
+            LOAD     s0, 00                ; 3FA  [unreachable]
+            LOAD     s0, 00                ; 3FB  [unreachable]
+            LOAD     s0, 00                ; 3FC  [unreachable]
+            LOAD     s0, 00                ; 3FD  [unreachable]
+            LOAD     s0, 00                ; 3FE  [unreachable]
+
+; Interrupt vector.
+            JUMP     isr                   ; 3FF

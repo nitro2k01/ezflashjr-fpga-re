@@ -1,0 +1,7 @@
+; Instruction-level diff bank1_FW0_golden -> bank1. Pure relocations (same instruction,
+; target moved with the code) and zero padding are left out.
+; Addresses: old / new.  1 change blocks
+
+@@ replace  old 1B8-1B8  new 1B8-1B8
+  - 1B8 00001  LOAD s0, 01
+  + 1B8 00002  LOAD s0, 02

@@ -1,0 +1,46 @@
+; Instruction-level diff FW4 -> FW5_slotB. Pure relocations (same instruction,
+; target moved with the code) and zero padding are left out.
+; Addresses: old / new.  4 change blocks
+
+@@ insert  old 03A-039  new 03A-04D
+  + 03A 00FEE  LOAD sF, EE
+  + 03B 30169  CALL 169
+  + 03C 045AC  INPUT s5, AC
+  + 03D 01F50  LOAD sF, s5
+  + 03E 30169  CALL 169
+  + 03F 045AB  INPUT s5, AB
+  + 040 01F50  LOAD sF, s5
+  + 041 30169  CALL 169
+  + 042 045AF  INPUT s5, AF
+  + 043 01F50  LOAD sF, s5
+  + 044 30169  CALL 169
+  + 045 045AE  INPUT s5, AE
+  + 046 01F50  LOAD sF, s5
+  + 047 30169  CALL 169
+  + 048 045A9  INPUT s5, A9
+  + 049 01F50  LOAD sF, s5
+  + 04A 30169  CALL 169
+  + 04B 045A8  INPUT s5, A8
+  + 04C 01F50  LOAD sF, s5
+  + 04D 30169  CALL 169
+
+@@ delete  old 197-1A0  new 1AB-1AA
+  - 197 00F99  LOAD sF, 99
+  - 198 30155  CALL 155
+  - 199 01FA0  LOAD sF, sA
+  - 19A 30155  CALL 155
+  - 19B 01F90  LOAD sF, s9
+  - 19C 30155  CALL 155
+  - 19D 01F80  LOAD sF, s8
+  - 19E 30155  CALL 155
+  - 19F 01F70  LOAD sF, s7
+  - 1A0 30155  CALL 155
+
+@@ insert  old 1BE-1BD  new 1C8-1C9
+  + 1C8 040BB  INPUT s0, BB
+  + 1C9 2E02B  STORE s0, 2B
+
+@@ insert  old 1D4-1D3  new 1E0-1E2
+  + 1E0 0602B  FETCH s0, 2B
+  + 1E1 14011  COMPARE s0, 11
+  + 1E2 351E4  JUMP Z, 1E4

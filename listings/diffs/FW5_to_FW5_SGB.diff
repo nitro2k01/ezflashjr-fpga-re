@@ -1,0 +1,45 @@
+; Instruction-level diff FW5 -> FW5_SGB. Pure relocations (same instruction,
+; target moved with the code) and zero padding are left out.
+; Addresses: old / new.  3 change blocks
+
+@@ insert  old 345-344  new 345-351
+  + 345 043B8  INPUT s3, B8
+  + 346 14301  COMPARE s3, 01
+  + 347 3574D  JUMP NZ, 34D
+  + 348 044A8  INPUT s4, A8
+  + 349 2C4A8  OUTPUT s4, A8
+  + 34A 00400  LOAD s4, 00
+  + 34B 2E436  STORE s4, 36
+  + 34C 3438D  JUMP 38D
+  + 34D 14302  COMPARE s3, 02
+  + 34E 35752  JUMP NZ, 352
+  + 34F 044A9  INPUT s4, A9
+  + 350 2C4A9  OUTPUT s4, A9
+  + 351 3438D  JUMP 38D
+
+@@ replace  old 366-366  new 373-373
+  - 366 3576B  JUMP NZ, 36B
+  + 373 35778  JUMP NZ, 378
+
+@@ insert  old 36B-36A  new 378-38C
+  + 378 14304  COMPARE s3, 04
+  + 379 3577F  JUMP NZ, 37F
+  + 37A 044A5  INPUT s4, A5
+  + 37B 2C4A5  OUTPUT s4, A5
+  + 37C 00400  LOAD s4, 00
+  + 37D 2E433  STORE s4, 33
+  + 37E 3438D  JUMP 38D
+  + 37F 14302  COMPARE s3, 02
+  + 380 35786  JUMP NZ, 386
+  + 381 044A6  INPUT s4, A6
+  + 382 2C4A6  OUTPUT s4, A6
+  + 383 00400  LOAD s4, 00
+  + 384 2E434  STORE s4, 34
+  + 385 3438D  JUMP 38D
+  + 386 14301  COMPARE s3, 01
+  + 387 3578D  JUMP NZ, 38D
+  + 388 044A7  INPUT s4, A7
+  + 389 2C4A7  OUTPUT s4, A7
+  + 38A 00400  LOAD s4, 00
+  + 38B 2E435  STORE s4, 35
+  + 38C 3438D  JUMP 38D
